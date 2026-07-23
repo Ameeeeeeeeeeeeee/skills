@@ -54,9 +54,12 @@ def force_enable_ddgs_bing() -> bool:
 
 
 SUPPORTED_ENGINES = ("bing", "google", "baidu")
+SUPPORTED_BACKENDS = ("auto", "ddgs", "html")
 DEFAULT_ENGINES = "bing,google,baidu"
+DEFAULT_BACKEND = "auto"
 DEFAULT_PROXY = "http://127.0.0.1:7897"
 DEFAULT_REGION = "cn-zh"
+DEFAULT_LANGUAGE = "zh-CN,zh;q=0.9,en;q=0.8"
 DEFAULT_TIMEOUT = 20.0
 DEFAULT_MAX_RESULTS = 5
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
@@ -69,7 +72,7 @@ USER_AGENT = (
 BASE_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Language": DEFAULT_LANGUAGE,
     "Cache-Control": "no-cache",
 }
 
@@ -96,6 +99,22 @@ def env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def language_for_region(region: str) -> str:
+    """Choose a sensible HTTP Accept-Language value from a region code."""
+
+    _country, _, language = region.lower().partition("-")
+    language = language or "en"
+    if language == "zh":
+        return DEFAULT_LANGUAGE
+    if language == "en":
+        return "en-US,en;q=0.9,zh-CN;q=0.7"
+    return f"{language},{language};q=0.9,en;q=0.7"
+
+
+def resolve_language(cli_language: str | None, region: str) -> str:
+    return cli_language or os.getenv("WEBSEARCH_LANG") or language_for_region(region)
 
 
 def resolve_proxy(cli_proxy: str | None) -> str:
@@ -225,8 +244,14 @@ def build_cookie_jar(specs: list[dict[str, str]]) -> httpx.Cookies:
     return cookies
 
 
-def make_client(proxy: str, specs: list[dict[str, str]], timeout: float) -> httpx.Client:
+def make_client(
+    proxy: str,
+    specs: list[dict[str, str]],
+    timeout: float,
+    language: str = DEFAULT_LANGUAGE,
+) -> httpx.Client:
     headers = dict(BASE_HEADERS)
+    headers["Accept-Language"] = language
     unscoped = [spec for spec in specs if not spec.get("domain")]
     if unscoped:
         headers["Cookie"] = "; ".join(
@@ -404,6 +429,61 @@ def parse_bing_html(html: str, max_results: int) -> list[dict[str, str]]:
     return dedupe_results(results, max_results)
 
 
+def make_news_result(
+    title: Any,
+    url: Any,
+    snippet: Any,
+    date: Any,
+    source: Any,
+    image: Any,
+    base_url: str,
+) -> dict[str, str] | None:
+    normalized_url = normalize_result_url(str(url or ""), base_url)
+    if not normalized_url:
+        return None
+    result = {
+        "title": clean_text(title) or normalized_url,
+        "url": normalized_url,
+        "snippet": clean_text(snippet),
+        "engine": "bing-news",
+        "date": clean_text(date),
+        "source": clean_text(source),
+    }
+    image_url = normalize_result_url(str(image or ""), base_url)
+    if image_url:
+        result["image"] = image_url
+    return result
+
+
+def parse_bing_news_html(html: str, max_results: int) -> list[dict[str, str]]:
+    challenge = challenge_error("bing", html)
+    if challenge:
+        raise challenge
+    soup = BeautifulSoup(html, "lxml")
+    results: list[dict[str, str]] = []
+    for block in soup.select("div.newsitem"):
+        title = block.get("data-title")
+        anchor = block.select_one("a.title, a[href]")
+        if not title and anchor is not None:
+            title = anchor.get_text(" ", strip=True)
+        url = block.get("url") or (anchor.get("href") if anchor else "")
+        snippet_node = block.select_one("div.snippet, .snippet")
+        date_node = block.select_one("span[aria-label]")
+        image_node = block.select_one("img")
+        result = make_news_result(
+            title,
+            url,
+            snippet_node.get_text(" ", strip=True) if snippet_node else "",
+            date_node.get("aria-label", "") if date_node else "",
+            block.get("data-author", ""),
+            image_node.get("src", "") if image_node else "",
+            "https://www.bing.com",
+        )
+        if result:
+            results.append(result)
+    return dedupe_results(results, max_results)
+
+
 def parse_baidu_html(html: str, max_results: int) -> list[dict[str, str]]:
     challenge = challenge_error("baidu", html)
     if challenge:
@@ -476,6 +556,7 @@ def search_html_engine(
     proxy: str,
     specs: list[dict[str, str]],
     timeout: float,
+    language: str,
 ) -> list[dict[str, str]]:
     if engine == "bing":
         url = "https://www.bing.com/search"
@@ -503,13 +584,44 @@ def search_html_engine(
         }
         parser = parse_google_html
 
-    with make_client(proxy, specs, timeout) as client:
+    with make_client(proxy, specs, timeout, language) as client:
         html, _response_info = get_html_response(
             client, url, params=params, max_bytes=2 * 1024 * 1024
         )
     results = parser(html, max_results)
     if not results:
         raise WebSearchError(f"{engine} returned no parseable results")
+    return results
+
+
+def search_bing_news_html(
+    query: str,
+    region: str,
+    max_results: int,
+    proxy: str,
+    specs: list[dict[str, str]],
+    timeout: float,
+    language: str,
+) -> list[dict[str, str]]:
+    country, _, region_language = region.lower().partition("-")
+    params = {
+        "q": query,
+        "InfiniteScroll": "1",
+        "first": "11",
+        "SFX": "1",
+        "cc": country,
+        "setlang": region_language or "en",
+    }
+    with make_client(proxy, specs, timeout, language) as client:
+        html, _response_info = get_html_response(
+            client,
+            "https://www.bing.com/news/infinitescrollajax",
+            params=params,
+            max_bytes=2 * 1024 * 1024,
+        )
+    results = parse_bing_news_html(html, max_results)
+    if not results:
+        raise WebSearchError("bing news returned no parseable results")
     return results
 
 
@@ -545,6 +657,51 @@ def search_google_ddgs(
     results = dedupe_results(results, max_results)
     if not results:
         raise WebSearchError("ddgs Google returned no parseable results")
+    return results
+
+
+def search_bing_news_ddgs(
+    query: str,
+    region: str,
+    max_results: int,
+    proxy: str,
+    timeout: float,
+) -> list[dict[str, str]]:
+    """Use DDGS's Bing News backend."""
+
+    if (
+        DDGS is None
+        or DDGS_ENGINES is None
+        or "bing" not in DDGS_ENGINES.get("news", {})
+    ):
+        raise WebSearchError(
+            "installed ddgs release does not expose a Bing News backend"
+        )
+    ddgs_timeout = max(1, int(round(timeout)))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        raw_results = DDGS(proxy=proxy, timeout=ddgs_timeout).news(
+            query,
+            region=region,
+            safesearch="moderate",
+            max_results=max_results,
+            backend="bing",
+        )
+    results: list[dict[str, str]] = []
+    for item in raw_results:
+        result = make_news_result(
+            item.get("title"),
+            item.get("url") or item.get("href"),
+            item.get("body") or item.get("snippet"),
+            item.get("date"),
+            item.get("source"),
+            item.get("image"),
+            "https://www.bing.com",
+        )
+        if result:
+            results.append(result)
+    results = dedupe_results(results, max_results)
+    if not results:
+        raise WebSearchError("ddgs Bing News returned no parseable results")
     return results
 
 
@@ -586,6 +743,45 @@ def search_bing_ddgs(
     return results
 
 
+def search_news_one(
+    engine: str,
+    query: str,
+    region: str,
+    max_results: int,
+    proxy: str,
+    specs: list[dict[str, str]],
+    timeout: float,
+    backend_mode: str,
+    language: str,
+) -> tuple[list[dict[str, str]], str]:
+    if engine != "bing":
+        raise WebSearchError("--news currently supports Bing only; use --engines bing")
+
+    if specs or backend_mode == "html":
+        backend = "httpx-html-news-cookies" if specs else "httpx-html-news"
+        return (
+            search_bing_news_html(
+                query, region, max_results, proxy, specs, timeout, language
+            ),
+            backend,
+        )
+
+    try:
+        return (
+            search_bing_news_ddgs(query, region, max_results, proxy, timeout),
+            "ddgs-news-bing",
+        )
+    except Exception:
+        if backend_mode == "ddgs":
+            raise
+        return (
+            search_bing_news_html(
+                query, region, max_results, proxy, specs, timeout, language
+            ),
+            "httpx-html-news-fallback",
+        )
+
+
 def search_one(
     engine: str,
     query: str,
@@ -594,24 +790,52 @@ def search_one(
     proxy: str,
     specs: list[dict[str, str]],
     timeout: float,
+    backend_mode: str,
+    news: bool,
+    language: str,
 ) -> tuple[list[dict[str, str]], str]:
+    if news:
+        return search_news_one(
+            engine,
+            query,
+            region,
+            max_results,
+            proxy,
+            specs,
+            timeout,
+            backend_mode,
+            language,
+        )
+
     # DDGS has no cookie injection API. Use the HTML adapter when cookies are supplied.
-    if engine in {"bing", "google"} and not specs:
+    if engine in {"bing", "google"} and not specs and backend_mode != "html":
         try:
             ddgs_search = search_bing_ddgs if engine == "bing" else search_google_ddgs
             backend = "ddgs-bing-forced" if engine == "bing" else "ddgs"
             return ddgs_search(query, region, max_results, proxy, timeout), backend
         except Exception:
+            if backend_mode == "ddgs":
+                raise
             # Keep the operation useful if DDGS changes or Google changes its HTML.
             return (
                 search_html_engine(
-                    engine, query, region, max_results, proxy, specs, timeout
+                    engine,
+                    query,
+                    region,
+                    max_results,
+                    proxy,
+                    specs,
+                    timeout,
+                    language,
                 ),
                 "httpx-html-fallback",
             )
+    backend = "httpx-html-cookies" if specs else "httpx-html"
     return (
-        search_html_engine(engine, query, region, max_results, proxy, specs, timeout),
-        "httpx-html",
+        search_html_engine(
+            engine, query, region, max_results, proxy, specs, timeout, language
+        ),
+        backend,
     )
 
 
@@ -633,8 +857,16 @@ def parse_engines(value: str) -> list[str]:
 
 def run_search(args: argparse.Namespace) -> dict[str, Any]:
     engines = parse_engines(args.engines)
+    if args.news:
+        if engines == list(SUPPORTED_ENGINES):
+            engines = ["bing"]
+        elif engines != ["bing"]:
+            raise WebSearchError(
+                "--news currently supports Bing only; use --engines bing"
+            )
     proxy = resolve_proxy(args.proxy)
     specs = load_cookie_specs(args.cookies)
+    language = resolve_language(args.lang, args.region)
     started = perf_counter()
     by_engine: dict[str, list[dict[str, str]]] = {}
     backends: dict[str, str] = {}
@@ -651,6 +883,9 @@ def run_search(args: argparse.Namespace) -> dict[str, Any]:
                 proxy,
                 specs,
                 args.timeout,
+                args.backend,
+                args.news,
+                language,
             ): engine
             for engine in engines
         }
@@ -676,6 +911,10 @@ def run_search(args: argparse.Namespace) -> dict[str, Any]:
         "operation": "search",
         "query": args.query,
         "engines": engines,
+        "search_type": "news" if args.news else "web",
+        "region": args.region,
+        "language": language,
+        "backend_mode": args.backend,
         "backends": backends,
         "proxy": {"enabled": True, "address": redact_proxy(proxy)},
         "cookies_loaded": len(specs),
@@ -738,8 +977,9 @@ def extract_content(html: str, output_format: str) -> tuple[str, str]:
 def run_fetch(args: argparse.Namespace) -> dict[str, Any]:
     proxy = resolve_proxy(args.proxy)
     specs = load_cookie_specs(args.cookies)
+    language = resolve_language(args.lang, DEFAULT_REGION)
     started = perf_counter()
-    with make_client(proxy, specs, args.timeout) as client:
+    with make_client(proxy, specs, args.timeout, language) as client:
         html, response_info = get_html_response(
             client,
             args.url,
@@ -768,6 +1008,7 @@ def run_fetch(args: argparse.Namespace) -> dict[str, Any]:
         "response_truncated": response_info["truncated"],
         "response_bytes": response_info["bytes"],
         "cookies_loaded": len(specs),
+        "language": language,
         "proxy": {"enabled": True, "address": redact_proxy(proxy)},
         "elapsed_ms": round((perf_counter() - started) * 1000),
     }
@@ -775,6 +1016,11 @@ def run_fetch(args: argparse.Namespace) -> dict[str, Any]:
 
 def add_network_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--proxy", help="Clash HTTP/HTTPS/SOCKS proxy URL")
+    parser.add_argument(
+        "--lang",
+        default=os.getenv("WEBSEARCH_LANG"),
+        help="Accept-Language header, e.g. en-US,en;q=0.9",
+    )
     parser.add_argument(
         "--cookies",
         default=os.getenv("WEBSEARCH_COOKIE_FILE"),
@@ -807,6 +1053,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=env_int("WEBSEARCH_MAX_RESULTS", DEFAULT_MAX_RESULTS),
         help="Maximum results per engine",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=SUPPORTED_BACKENDS,
+        default=os.getenv("WEBSEARCH_BACKEND", DEFAULT_BACKEND),
+        help="Search backend policy: auto, ddgs, or html",
+    )
+    parser.add_argument(
+        "--news",
+        action="store_true",
+        help="Use Bing News; defaults to the Bing engine only",
     )
     add_network_options(parser)
     return parser
