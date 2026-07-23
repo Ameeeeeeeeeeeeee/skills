@@ -32,6 +32,27 @@ except ImportError:
     DDGS_ENGINES = None
 
 
+def force_enable_ddgs_bing() -> bool:
+    """Re-register DDGS's text Bing engine even when the package disables it."""
+
+    global DDGS_ENGINES
+
+    if DDGS is None:
+        return False
+    try:
+        import ddgs.engines as engine_registry
+        from ddgs.engines.bing import Bing
+    except (ImportError, AttributeError):
+        return False
+
+    # Recent DDGS releases keep Bing in the source tree but mark the text
+    # engine disabled. Put it back into the runtime registry deliberately.
+    Bing.disabled = False
+    engine_registry.ENGINES.setdefault("text", {})["bing"] = Bing
+    DDGS_ENGINES = engine_registry.ENGINES
+    return True
+
+
 SUPPORTED_ENGINES = ("bing", "google", "baidu")
 DEFAULT_ENGINES = "bing,google,baidu"
 DEFAULT_PROXY = "http://127.0.0.1:7897"
@@ -534,8 +555,9 @@ def search_bing_ddgs(
     proxy: str,
     timeout: float,
 ) -> list[dict[str, str]]:
-    """Use DDGS Bing when an installed release exposes it."""
+    """Use DDGS Bing, deliberately overriding its disabled registry flag."""
 
+    force_enable_ddgs_bing()
     if DDGS is None or DDGS_ENGINES is None or "bing" not in DDGS_ENGINES.get("text", {}):
         raise WebSearchError("installed ddgs release does not expose a Bing backend")
     ddgs_timeout = max(1, int(round(timeout)))
@@ -577,7 +599,8 @@ def search_one(
     if engine in {"bing", "google"} and not specs:
         try:
             ddgs_search = search_bing_ddgs if engine == "bing" else search_google_ddgs
-            return ddgs_search(query, region, max_results, proxy, timeout), "ddgs"
+            backend = "ddgs-bing-forced" if engine == "bing" else "ddgs"
+            return ddgs_search(query, region, max_results, proxy, timeout), backend
         except Exception:
             # Keep the operation useful if DDGS changes or Google changes its HTML.
             return (
