@@ -6,19 +6,30 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import ctypes
+import ctypes.wintypes
 import io
 import json
 import os
 import re
+import shutil
+import sqlite3
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from time import perf_counter
 from typing import Any
-from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 import trafilatura
+
+# DDGS is not thread-safe; serialize all DDGS calls through this lock.
+_ddgs_lock = threading.Lock()
 from bs4 import BeautifulSoup
 
 try:
@@ -53,10 +64,13 @@ def force_enable_ddgs_bing() -> bool:
     return True
 
 
-SUPPORTED_ENGINES = ("bing", "google", "baidu")
+SUPPORTED_ENGINES = ("bing", "duckduckgo", "baidu")
+COOKIE_CACHE_ENGINES = ("bing", "baidu")
 SUPPORTED_BACKENDS = ("auto", "ddgs", "html")
-DEFAULT_ENGINES = "bing,google,baidu"
+SUPPORTED_BROWSER_COOKIE_SOURCES = ("off", "auto", "edge")
+DEFAULT_ENGINES = "bing,duckduckgo"
 DEFAULT_BACKEND = "auto"
+DEFAULT_BROWSER_COOKIE_SOURCE = "auto"
 DEFAULT_PROXY = "http://127.0.0.1:7897"
 DEFAULT_REGION = "cn-zh"
 DEFAULT_LANGUAGE = "zh-CN,zh;q=0.9,en;q=0.8"
@@ -64,6 +78,8 @@ DEFAULT_TIMEOUT = 20.0
 DEFAULT_MAX_RESULTS = 5
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_CHARS = 30_000
+DEFAULT_COOKIE_CACHE_MAX_AGE = 7 * 24 * 60 * 60
+COOKIE_CACHE_MAGIC = b"WEBSEARCH-BING-COOKIE-CACHE-V1\n"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -79,6 +95,10 @@ BASE_HEADERS = {
 
 class WebSearchError(RuntimeError):
     """An expected search/fetch failure that can be returned as JSON."""
+
+
+class BrowserCookieError(WebSearchError):
+    """A browser cookie source could not be read safely."""
 
 
 def env_float(name: str, default: float) -> float:
@@ -230,6 +250,479 @@ def normalize_cookie_entries(entries: list[Any]) -> list[dict[str, str]]:
     return specs
 
 
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+
+def _dpapi_unprotect(value: bytes) -> bytes:
+    """Decrypt a Windows DPAPI blob without exposing it in diagnostics."""
+
+    if os.name != "nt":
+        raise BrowserCookieError("Edge cookie decryption is only supported on Windows")
+    if not value:
+        raise BrowserCookieError("Edge returned an empty encrypted value")
+
+    input_buffer = ctypes.create_string_buffer(value)
+    input_blob = _DataBlob(
+        len(value), ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_char))
+    )
+    output_blob = _DataBlob()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    ok = crypt32.CryptUnprotectData(
+        ctypes.byref(input_blob),
+        None,
+        None,
+        None,
+        None,
+        0,
+        ctypes.byref(output_blob),
+    )
+    if not ok:
+        raise BrowserCookieError(
+            f"Windows could not decrypt the Edge cookie data: {ctypes.WinError()}"
+        )
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        kernel32.LocalFree(output_blob.pbData)
+
+
+def _dpapi_protect(value: bytes) -> bytes:
+    """Encrypt a cache payload for the current Windows user."""
+
+    if os.name != "nt":
+        raise BrowserCookieError("Cookie cache encryption is only supported on Windows")
+    if not value:
+        raise BrowserCookieError("Cannot encrypt an empty cookie cache")
+
+    input_buffer = ctypes.create_string_buffer(value)
+    input_blob = _DataBlob(
+        len(value), ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_char))
+    )
+    output_blob = _DataBlob()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    ok = crypt32.CryptProtectData(
+        ctypes.byref(input_blob),
+        None,
+        None,
+        None,
+        None,
+        0x01,  # CRYPTPROTECT_UI_FORBIDDEN
+        ctypes.byref(output_blob),
+    )
+    if not ok:
+        raise BrowserCookieError(
+            f"Windows could not encrypt the cookie cache: {ctypes.WinError()}"
+        )
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        kernel32.LocalFree(output_blob.pbData)
+
+
+def cookie_cache_path(engine: str = "bing") -> Path:
+    """Return an engine-specific cache path outside the Skill repository."""
+
+    if engine not in COOKIE_CACHE_ENGINES:
+        raise BrowserCookieError(f"Cookie cache is not supported for {engine}")
+    configured = os.getenv(f"WEBSEARCH_{engine.upper()}_COOKIE_CACHE")
+    if engine == "bing":
+        configured = configured or os.getenv("WEBSEARCH_COOKIE_CACHE")
+    if configured:
+        return Path(configured).expanduser()
+    return (
+        Path.home()
+        / ".agents"
+        / "cache"
+        / "web-search"
+        / f"{engine}-cookies.dpapi"
+    )
+
+
+def cookie_export_path(engine: str = "bing") -> Path:
+    """Return the default Cookie Editor export path for one engine."""
+
+    if engine not in COOKIE_CACHE_ENGINES:
+        raise BrowserCookieError(f"Cookie export is not supported for {engine}")
+    configured = os.getenv(f"WEBSEARCH_{engine.upper()}_COOKIE_EXPORT")
+    if engine == "bing":
+        configured = configured or os.getenv("WEBSEARCH_COOKIE_EXPORT")
+    if configured:
+        return Path(configured).expanduser()
+    return cookie_cache_path(engine).with_name(f"{engine}.json")
+
+
+def _delete_cookie_cache(engine: str = "bing") -> None:
+    try:
+        cookie_cache_path(engine).unlink(missing_ok=True)
+    except OSError:
+        # A stale cache must not prevent the manual refresh path.
+        pass
+
+
+def load_cookie_cache_specs(
+    engine: str = "bing",
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Load an encrypted engine cookie cache without exposing cookie values."""
+
+    path = cookie_cache_path(engine)
+    try:
+        encrypted = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise BrowserCookieError(f"{engine} cookie cache does not exist") from exc
+    except OSError as exc:
+        raise BrowserCookieError(f"Could not read the {engine} cookie cache: {exc}") from exc
+
+    if not encrypted.startswith(COOKIE_CACHE_MAGIC):
+        _delete_cookie_cache(engine)
+        raise BrowserCookieError(f"{engine} cookie cache has an unsupported format")
+    try:
+        payload = json.loads(_dpapi_unprotect(encrypted[len(COOKIE_CACHE_MAGIC) :]))
+    except (BrowserCookieError, UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+        _delete_cookie_cache(engine)
+        raise BrowserCookieError(f"{engine} cookie cache could not be decrypted") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("cookies"), list):
+        _delete_cookie_cache(engine)
+        raise BrowserCookieError(f"{engine} cookie cache is incomplete")
+
+    valid_until = payload.get("valid_until")
+    try:
+        if valid_until is not None and float(valid_until) <= time.time():
+            _delete_cookie_cache(engine)
+            raise BrowserCookieError(f"{engine} cookie cache has expired")
+    except (TypeError, ValueError) as exc:
+        _delete_cookie_cache(engine)
+        raise BrowserCookieError(f"{engine} cookie cache has an invalid expiry") from exc
+
+    try:
+        specs = normalize_cookie_entries(payload["cookies"])
+    except WebSearchError as exc:
+        _delete_cookie_cache(engine)
+        raise BrowserCookieError(f"{engine} cookie cache contains no usable cookies") from exc
+    return specs, {
+        "source": "cache",
+        "engine": engine,
+        "status": "loaded",
+        "cache_path": str(path),
+        "cached_at": payload.get("cached_at"),
+        "valid_until": valid_until,
+        "cookies_loaded": len(specs),
+    }
+
+
+def save_cookie_cache_specs(
+    specs: list[dict[str, str]],
+    source_info: dict[str, Any],
+    engine: str = "bing",
+) -> dict[str, Any]:
+    """Persist engine cookies encrypted for the current Windows user."""
+
+    if os.name != "nt":
+        raise BrowserCookieError("Automatic cookie caching is only supported on Windows")
+    if not specs:
+        raise BrowserCookieError(f"Cannot cache an empty {engine} cookie set")
+
+    now = time.time()
+    max_age = max(
+        300.0,
+        env_float("WEBSEARCH_COOKIE_CACHE_MAX_AGE", DEFAULT_COOKIE_CACHE_MAX_AGE),
+    )
+    valid_until = now + max_age
+    source_expiry = source_info.get("cache_expires_at")
+    if source_expiry is not None:
+        try:
+            valid_until = min(valid_until, float(source_expiry))
+        except (TypeError, ValueError):
+            pass
+    if valid_until <= now:
+        raise BrowserCookieError(f"All browser {engine} cookies are already expired")
+
+    payload = {
+        "version": 1,
+        "cached_at": now,
+        "valid_until": valid_until,
+        "cookies": [
+            {
+                "name": spec["name"],
+                "value": spec["value"],
+                "domain": spec.get("domain", ""),
+                "path": spec.get("path") or "/",
+            }
+            for spec in specs
+        ],
+    }
+    encrypted = COOKIE_CACHE_MAGIC + _dpapi_protect(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    path = cookie_cache_path(engine)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        temporary_path.write_bytes(encrypted)
+        os.replace(temporary_path, path)
+    except OSError as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except (OSError, UnboundLocalError):
+            pass
+        raise BrowserCookieError(
+            f"Could not save the {engine} cookie cache: {exc}"
+        ) from exc
+    return {
+        "engine": engine,
+        "cache_path": str(path),
+        "cached_at": now,
+        "valid_until": valid_until,
+        "cookies_loaded": len(specs),
+    }
+
+
+def cookie_domain_matches_engine(spec: dict[str, str], engine: str) -> bool:
+    """Keep an export scoped to the search engine it is refreshing."""
+
+    domain = spec.get("domain", "").lower().lstrip(".")
+    if not domain:
+        return True
+    if engine == "bing":
+        return domain == "bing.com" or domain.endswith(".bing.com")
+    if engine == "baidu":
+        return domain == "baidu.com" or domain.endswith(".baidu.com")
+    return False
+
+
+def cookie_specs_for_engine(
+    specs: list[dict[str, str]], engine: str
+) -> list[dict[str, str]]:
+    """Restrict a shared export to cookies that can be sent to one engine."""
+
+    return [spec for spec in specs if cookie_domain_matches_engine(spec, engine)]
+
+
+def load_cookie_export_specs(
+    engine: str,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Load an engine-scoped Cookie Editor export without printing values."""
+
+    path = cookie_export_path(engine)
+    if not path.is_file():
+        raise BrowserCookieError(
+            f"{engine} Cookie Editor export does not exist: {path}"
+        )
+    try:
+        specs = load_cookie_specs(str(path))
+    except WebSearchError as exc:
+        raise BrowserCookieError(
+            f"{engine} Cookie Editor export is invalid: {clean_text(str(exc))}"
+        ) from exc
+    scoped_specs = [
+        spec for spec in specs if cookie_domain_matches_engine(spec, engine)
+    ]
+    if not scoped_specs:
+        raise BrowserCookieError(
+            f"{engine} Cookie Editor export contains no {engine} cookies"
+        )
+    return scoped_specs, {
+        "source": "export",
+        "engine": engine,
+        "export_path": str(path),
+        "cookies_loaded": len(scoped_specs),
+    }
+
+
+def _edge_user_data_dir() -> Path:
+    configured = os.getenv("WEBSEARCH_EDGE_USER_DATA")
+    if configured:
+        return Path(configured).expanduser()
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if not local_app_data:
+        raise BrowserCookieError("LOCALAPPDATA is not set; cannot locate Edge")
+    return Path(local_app_data) / "Microsoft" / "Edge" / "User Data"
+
+
+def _edge_is_running() -> bool:
+    """Return whether any Edge process is still holding the profile open."""
+
+    if os.name != "nt":
+        return False
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq msedge.exe", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(re.search(r'(?im)^"msedge\.exe",', result.stdout or ""))
+
+
+def _edge_profile_name(user_data_dir: Path) -> str:
+    configured = os.getenv("WEBSEARCH_EDGE_PROFILE")
+    if configured:
+        return configured
+    state_path = user_data_dir / "Local State"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        last_used = state.get("profile", {}).get("last_used")
+        if isinstance(last_used, str) and last_used:
+            return last_used
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    return "Default"
+
+
+def _edge_master_key(user_data_dir: Path) -> bytes:
+    state_path = user_data_dir / "Local State"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        encoded_key = state["os_crypt"]["encrypted_key"]
+        encrypted_key = base64.b64decode(encoded_key)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise BrowserCookieError("Edge encryption key is unavailable") from exc
+
+    if encrypted_key.startswith(b"DPAPI"):
+        return _dpapi_unprotect(encrypted_key[5:])
+    raise BrowserCookieError(
+        "This Edge profile uses an unsupported app-bound cookie encryption format"
+    )
+
+
+def _decrypt_edge_cookie(encrypted_value: bytes, master_key: bytes) -> str | None:
+    if not encrypted_value:
+        return ""
+    if encrypted_value.startswith((b"v10", b"v11", b"v20")):
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+            nonce = encrypted_value[3:15]
+            ciphertext = encrypted_value[15:]
+            return AESGCM(master_key).decrypt(nonce, ciphertext, None).decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:  # noqa: BLE001 - one bad cookie must not abort the batch.
+            return None
+    try:
+        return _dpapi_unprotect(encrypted_value).decode("utf-8", errors="replace")
+    except BrowserCookieError:
+        return None
+
+
+def _copy_edge_cookie_database(source: Path, destination_dir: Path) -> Path:
+    """Copy the DB and sidecars so SQLite can be read without touching Edge."""
+
+    destination = destination_dir / "Cookies"
+    try:
+        shutil.copy2(source, destination)
+        for suffix in ("-wal", "-shm"):
+            sidecar = source.with_name(source.name + suffix)
+            if sidecar.is_file():
+                shutil.copy2(sidecar, destination_dir / sidecar.name)
+    except OSError as exc:
+        message = str(exc).lower()
+        if getattr(exc, "winerror", None) == 32 or "used by another process" in message:
+            raise BrowserCookieError(
+                "Edge cookie database is locked. Close every Edge window and its "
+                "background msedge.exe process, then retry; or provide an exported "
+                "cookies.txt/JSON file."
+            ) from exc
+        raise BrowserCookieError(f"Could not copy the Edge cookie database: {exc}") from exc
+    return destination
+
+
+def load_edge_cookie_specs() -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Load readable Bing cookies from the user's Edge profile.
+
+    The live Edge database is never opened for writing and is copied to a private
+    temporary directory first. If Edge holds an exclusive Windows file lock, the
+    caller receives a clear manual/export fallback instead of guessing.
+    """
+
+    if os.name != "nt":
+        raise BrowserCookieError("Automatic Edge cookies are only supported on Windows")
+    if _edge_is_running():
+        raise BrowserCookieError(
+            "Edge is running. Close every Edge window and background msedge.exe "
+            "process, confirm that it is closed, then retry before saving a new "
+            "cookie cache."
+        )
+    user_data_dir = _edge_user_data_dir()
+    profile = _edge_profile_name(user_data_dir)
+    cookie_db = user_data_dir / profile / "Network" / "Cookies"
+    if not cookie_db.is_file():
+        raise BrowserCookieError(
+            f"Edge cookie database was not found for profile {profile!r}"
+        )
+
+    master_key = _edge_master_key(user_data_dir)
+    specs: list[dict[str, str]] = []
+    skipped_encrypted = 0
+    with tempfile.TemporaryDirectory(prefix="websearch-edge-") as temporary_dir:
+        copied_db = _copy_edge_cookie_database(cookie_db, Path(temporary_dir))
+        try:
+            uri = f"file:{copied_db.as_posix()}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=3)
+            rows = connection.execute(
+                "SELECT host_key, name, path, value, encrypted_value, expires_utc "
+                "FROM cookies WHERE host_key = 'bing.com' "
+                "OR host_key LIKE '%.bing.com'"
+            ).fetchall()
+            connection.close()
+        except sqlite3.Error as exc:
+            raise BrowserCookieError(f"Could not read the copied Edge cookie database: {exc}") from exc
+
+    chromium_now = int((time.time() + 11644473600) * 1_000_000)
+    cache_expiries: list[float] = []
+    for host_key, name, cookie_path, value, encrypted_value, expires_utc in rows:
+        if expires_utc and int(expires_utc) < chromium_now:
+            continue
+        if expires_utc:
+            cache_expiries.append(int(expires_utc) / 1_000_000 - 11644473600)
+        cookie_value = str(value or "")
+        if not cookie_value and encrypted_value:
+            cookie_value = _decrypt_edge_cookie(bytes(encrypted_value), master_key) or ""
+            if not cookie_value:
+                skipped_encrypted += 1
+                continue
+        if not name:
+            continue
+        specs.append(
+            {
+                "name": str(name),
+                "value": cookie_value,
+                "domain": str(host_key or ""),
+                "path": str(cookie_path or "/"),
+            }
+        )
+
+    if not specs:
+        detail = "; encrypted values could not be decrypted" if skipped_encrypted else ""
+        raise BrowserCookieError(
+            f"No usable Bing cookies were found in Edge profile {profile!r}{detail}"
+        )
+    info: dict[str, Any] = {
+        "source": "edge",
+        "profile": profile,
+        "cookies_loaded": len(specs),
+    }
+    if cache_expiries:
+        info["cache_expires_at"] = min(cache_expiries)
+    return specs, info
+
+
+def load_edge_browser_cookie_specs() -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Read cookies from a closed Edge profile; never attach to live Edge."""
+
+    return load_edge_cookie_specs()
+
+
 def build_cookie_jar(specs: list[dict[str, str]]) -> httpx.Cookies:
     cookies = httpx.Cookies()
     for spec in specs:
@@ -315,25 +808,54 @@ def challenge_error(engine: str, html: str) -> WebSearchError | None:
     title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
     visible = clean_text(soup.get_text(" ", strip=True)).lower()
     title_and_text = f"{title.lower()} {visible}"
-    if engine == "google" and title.lower() == "google search" and not soup.select("h3"):
-        return WebSearchError(
-            "google returned a challenge/consent page; retry with --cookies"
+    baidu_challenge_text = (
+        engine == "baidu"
+        and any(
+            marker in title_and_text
+            for marker in (
+                "\u5b89\u5168\u9a8c\u8bc1",       # 安全验证
+                "\u767e\u5ea6\u5b89\u5168\u9a8c\u8bc1", # 百度安全验证
+                "\u5b89\u5168\u68c0\u67e5",       # 安全检查
+                "\u8bf7\u5b8c\u6210\u9a8c\u8bc1",   # 请完成验证
+                "\u8bf7\u8f93\u5165\u9a8c\u8bc1\u7801", # 请输入验证码
+                "\u8bbf\u95ee\u8fc7\u4e8e\u9891\u7e41", # 访问过于频繁
+            )
         )
+    )
     markers = {
-        "bing": ("captcha", "verify you are human", "unusual traffic", "robot"),
-        "google": (
+        "bing": (
+            "captcha",
+            "verify you are human",
             "unusual traffic",
-            "our systems have detected unusual traffic",
-            "not a robot",
-            "consent.google.com",
-            "if you're having trouble accessing google search",
-            "please click here if you are not redirected",
+            "robot",
+            "one last step",
+            "please solve the challenge below",
         ),
         "baidu": ("安全验证", "百度安全验证", "安全检查", "请完成验证"),
     }
-    if any(marker in title_and_text for marker in markers.get(engine, ())):
+    bing_captcha_node = bool(
+        engine == "bing"
+        and soup.find(
+            class_=re.compile(r"captcha|challenge|verify", re.IGNORECASE)
+        )
+    )
+    raw_lower = html.lower()
+    bing_captcha_markup = bool(
+        engine == "bing"
+        and any(
+            marker in raw_lower
+            for marker in ("captcha_header", "captcha_text", "class=\"captcha\"")
+        )
+    )
+    if (
+        any(marker in title_and_text for marker in markers.get(engine, ()))
+        or baidu_challenge_text
+        or bing_captcha_node
+        or bing_captcha_markup
+    ):
         return WebSearchError(
-            f"{engine} returned an anti-bot verification page; retry with --cookies"
+            f"{engine} returned a CAPTCHA/challenge page; retry with browser cookies "
+            "or manual browser handoff"
         )
     return None
 
@@ -350,57 +872,6 @@ def dedupe_results(results: list[dict[str, str]], limit: int) -> list[dict[str, 
         if len(unique) >= limit:
             break
     return unique
-
-
-def google_region_params(region: str) -> dict[str, str]:
-    country, _, language = region.lower().partition("-")
-    language = language or "en"
-    return {
-        "hl": f"{language}-{country.upper()}",
-        "lr": f"lang_{language}",
-        "cr": f"country{country.upper()}",
-    }
-
-
-def parse_google_html(html: str, max_results: int) -> list[dict[str, str]]:
-    challenge = challenge_error("google", html)
-    if challenge:
-        raise challenge
-    soup = BeautifulSoup(html, "lxml")
-    results: list[dict[str, str]] = []
-    containers = soup.select("div.MjjYud, div.g")
-    headings = [container.select_one("h3") for container in containers]
-    if not any(headings):
-        headings = soup.select("h3")
-
-    for heading in headings:
-        if heading is None:
-            continue
-        anchor = heading.find_parent("a")
-        if anchor is None:
-            anchor = heading.find("a")
-        if anchor is None:
-            continue
-        snippet = ""
-        container = heading.parent
-        for _ in range(6):
-            if container is None:
-                break
-            snippet_node = container.select_one(".VwiC3b, .IsZvec, .aCOpRe")
-            if snippet_node is not None:
-                snippet = snippet_node.get_text(" ", strip=True)
-                break
-            container = container.parent
-        result = make_result(
-            heading.get_text(" ", strip=True),
-            anchor.get("href"),
-            snippet,
-            "google",
-            "https://www.google.com",
-        )
-        if result:
-            results.append(result)
-    return dedupe_results(results, max_results)
 
 
 def parse_bing_html(html: str, max_results: int) -> list[dict[str, str]]:
@@ -559,11 +1030,12 @@ def search_html_engine(
     language: str,
 ) -> list[dict[str, str]]:
     if engine == "bing":
+        country, _, language = region.lower().partition("-")
         url = "https://www.bing.com/search"
         params = {
             "q": query,
             "count": str(max_results),
-            "setlang": google_region_params(region)["hl"],
+            "setlang": f"{language or 'en'}-{country.upper()}",
         }
         parser = parse_bing_html
     elif engine == "baidu":
@@ -575,14 +1047,7 @@ def search_html_engine(
         }
         parser = parse_baidu_html
     else:
-        url = "https://www.google.com/search"
-        params = {
-            "q": query,
-            "num": str(max_results),
-            "gbv": "1",
-            **google_region_params(region),
-        }
-        parser = parse_google_html
+        raise WebSearchError(f"unsupported engine: {engine}")
 
     with make_client(proxy, specs, timeout, language) as client:
         html, _response_info = get_html_response(
@@ -625,41 +1090,6 @@ def search_bing_news_html(
     return results
 
 
-def search_google_ddgs(
-    query: str,
-    region: str,
-    max_results: int,
-    proxy: str,
-    timeout: float,
-) -> list[dict[str, str]]:
-    if DDGS is None:
-        raise WebSearchError("ddgs is not installed")
-    ddgs_timeout = max(1, int(round(timeout)))
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        raw_results = DDGS(proxy=proxy, timeout=ddgs_timeout).text(
-            query,
-            region=region,
-            safesearch="moderate",
-            max_results=max_results,
-            backend="google",
-        )
-    results: list[dict[str, str]] = []
-    for item in raw_results:
-        result = make_result(
-            item.get("title"),
-            item.get("href") or item.get("url"),
-            item.get("body") or item.get("snippet"),
-            "google",
-            "https://www.google.com",
-        )
-        if result:
-            results.append(result)
-    results = dedupe_results(results, max_results)
-    if not results:
-        raise WebSearchError("ddgs Google returned no parseable results")
-    return results
-
-
 def search_bing_news_ddgs(
     query: str,
     region: str,
@@ -679,7 +1109,7 @@ def search_bing_news_ddgs(
         )
     ddgs_timeout = max(1, int(round(timeout)))
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        raw_results = DDGS(proxy=proxy, timeout=ddgs_timeout).news(
+        items = DDGS(proxy=proxy, timeout=ddgs_timeout).news(
             query,
             region=region,
             safesearch="moderate",
@@ -687,7 +1117,7 @@ def search_bing_news_ddgs(
             backend="bing",
         )
     results: list[dict[str, str]] = []
-    for item in raw_results:
+    for item in items:
         result = make_news_result(
             item.get("title"),
             item.get("url") or item.get("href"),
@@ -719,7 +1149,7 @@ def search_bing_ddgs(
         raise WebSearchError("installed ddgs release does not expose a Bing backend")
     ddgs_timeout = max(1, int(round(timeout)))
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        raw_results = DDGS(proxy=proxy, timeout=ddgs_timeout).text(
+        items = DDGS(proxy=proxy, timeout=ddgs_timeout).text(
             query,
             region=region,
             safesearch="moderate",
@@ -727,7 +1157,7 @@ def search_bing_ddgs(
             backend="bing",
         )
     results: list[dict[str, str]] = []
-    for item in raw_results:
+    for item in items:
         result = make_result(
             item.get("title"),
             item.get("href") or item.get("url"),
@@ -740,6 +1170,46 @@ def search_bing_ddgs(
     results = dedupe_results(results, max_results)
     if not results:
         raise WebSearchError("ddgs Bing returned no parseable results")
+    return results
+
+
+def search_duckduckgo_ddgs(
+    query: str,
+    region: str,
+    max_results: int,
+    proxy: str,
+    timeout: float,
+) -> list[dict[str, str]]:
+    """DDGS native DuckDuckGo backend — no cookies or HTML fallback needed."""
+
+    if DDGS is None:
+        raise WebSearchError("ddgs is not installed")
+    ddgs_timeout = max(1, int(round(timeout)))
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        ddgs = DDGS(proxy=proxy, timeout=ddgs_timeout)
+        raw_results = ddgs.text(query, region=region, safesearch="moderate", max_results=max_results)
+        # Materialize the generator with a timeout, since DDGS can hang on some proxies.
+        with ThreadPoolExecutor(1) as pool:
+            fut = pool.submit(list, raw_results)
+            try:
+                items = fut.result(timeout=ddgs_timeout + 5)
+            except FutureTimeout:
+                raise WebSearchError("DuckDuckGo DDGS timed out")
+    results: list[dict[str, str]] = []
+    for item in items:
+        result = make_result(
+            item.get("title"),
+            item.get("href") or item.get("url"),
+            item.get("body") or item.get("snippet"),
+            "duckduckgo",
+            "https://duckduckgo.com",
+        )
+        if result:
+            results.append(result)
+    results = dedupe_results(results, max_results)
+    if not results:
+        raise WebSearchError("DuckDuckGo returned no parseable results")
     return results
 
 
@@ -807,12 +1277,19 @@ def search_one(
             language,
         )
 
+    # DuckDuckGo always uses DDGS natively — no cookies or HTML fallback.
+    if engine == "duckduckgo":
+        with _ddgs_lock:
+            return (
+                search_duckduckgo_ddgs(query, region, max_results, proxy, timeout),
+                "ddgs-duckduckgo",
+            )
+
     # DDGS has no cookie injection API. Use the HTML adapter when cookies are supplied.
-    if engine in {"bing", "google"} and not specs and backend_mode != "html":
+    if engine in {"bing"} and not specs and backend_mode != "html":
         try:
-            ddgs_search = search_bing_ddgs if engine == "bing" else search_google_ddgs
-            backend = "ddgs-bing-forced" if engine == "bing" else "ddgs"
-            return ddgs_search(query, region, max_results, proxy, timeout), backend
+            with _ddgs_lock:
+                return search_bing_ddgs(query, region, max_results, proxy, timeout), "ddgs-bing-forced"
         except Exception:
             if backend_mode == "ddgs":
                 raise
@@ -855,17 +1332,152 @@ def parse_engines(value: str) -> list[str]:
     return engines
 
 
-def run_search(args: argparse.Namespace) -> dict[str, Any]:
-    engines = parse_engines(args.engines)
-    if args.news:
-        if engines == list(SUPPORTED_ENGINES):
-            engines = ["bing"]
-        elif engines != ["bing"]:
+def query_is_chinese_or_china_related(query: str) -> bool:
+    """Select Baidu for Chinese-language or China-focused queries."""
+
+    if re.search(r"[\u3400-\u9fff]", query):
+        return True
+    lowered = query.casefold()
+    markers = (
+        "china",
+        "chinese",
+        "beijing",
+        "shanghai",
+        "shenzhen",
+        "guangzhou",
+        "hong kong",
+        "macau",
+        "taiwan",
+        "mainland china",
+    )
+    return any(
+        re.search(rf"(?<![a-z]){re.escape(marker)}(?![a-z])", lowered)
+        for marker in markers
+    )
+
+
+def resolve_engines(
+    configured: str | None,
+    query: str,
+    region: str,
+    news: bool,
+) -> list[str]:
+    """Resolve explicit engines or the default Bing/Google/Baidu policy."""
+
+    configured = configured or os.getenv("WEBSEARCH_ENGINES")
+    if configured:
+        engines = parse_engines(configured)
+    else:
+        engines = ["bing", "duckduckgo"]
+        if query_is_chinese_or_china_related(query):
+            engines.append("baidu")
+
+    if news:
+        if configured and engines != ["bing"]:
             raise WebSearchError(
                 "--news currently supports Bing only; use --engines bing"
             )
+        return ["bing"]
+    return engines
+
+
+def is_captcha_error(error: str) -> bool:
+    lowered = error.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "captcha",
+            "challenge page",
+            "consent",
+            "anti-bot",
+            "verification page",
+            "http 403",
+            "http 429",
+            "http 503",
+            "rate limit",
+            "too many requests",
+        )
+    )
+
+
+def manual_search_action(
+    engine: str,
+    query: str,
+    region: str,
+    max_results: int,
+    news: bool,
+    reason: str,
+) -> dict[str, Any]:
+    country, _, language = region.lower().partition("-")
+    if engine == "baidu":
+        base_url = "https://www.baidu.com/s"
+        params = {"wd": query, "rn": str(max_results), "ie": "utf-8"}
+    elif news:
+        base_url = "https://www.bing.com/news/search"
+        params = {"q": query, "setlang": language or "en", "cc": country}
+    else:
+        base_url = "https://www.bing.com/search"
+        params = {
+            "q": query,
+            "count": str(max_results),
+            "setlang": language or "en",
+        }
+    export_path = cookie_export_path(engine)
+    if reason == "cookie_export_required":
+        phase = "export_cookie"
+        instructions = (
+            f"Open this {engine} URL in Edge. If it shows a challenge or consent "
+            f"page, complete it manually, then use Cookie Editor to export JSON or "
+            f"Netscape cookies to {export_path}. Rerun the same search afterward. "
+            "Do not paste cookie values."
+        )
+    elif reason == "cookie_export_refresh_required":
+        phase = "authenticate_then_export"
+        instructions = (
+            f"The cached {engine} cookies were rejected. Open this URL in Edge, "
+            f"complete the CAPTCHA or consent step manually, overwrite {export_path} "
+            "with a fresh Cookie Editor JSON or Netscape export, and rerun the same "
+            "search. Do not paste cookie values."
+        )
+    elif reason == "bing_cookie_refresh_close_edge":
+        phase = "close_edge"
+        instructions = (
+            "Close every Edge window and background msedge.exe process yourself. "
+            "Do not force-close it through this Skill. After you have confirmed that "
+            "Edge is closed, rerun the same search; the Skill will read the profile, "
+            "save an encrypted local cookie cache, and retry. Do not paste cookie values."
+        )
+    elif reason == "bing_cookie_manual_refresh":
+        phase = "authenticate_then_close_edge"
+        instructions = (
+            "Open this URL in Edge, complete Bing's CAPTCHA or sign-in manually, then "
+            "close every Edge window and background msedge.exe process. After that, "
+            "rerun the same search; the Skill will read the new cookies, refresh its "
+            "encrypted local cache, and retry. Do not paste cookie values."
+        )
+    else:
+        phase = "manual_result_handoff"
+        instructions = (
+            "Open this URL in Edge and complete the challenge manually. Do not paste "
+            "cookie values; rerun the search after completion or provide result URLs."
+        )
+    return {
+        "required": True,
+        "engine": engine,
+        "reason": reason,
+        "phase": phase,
+        "url": f"{base_url}?{urlencode(params)}",
+        "instructions": instructions,
+    }
+
+
+def run_search(args: argparse.Namespace) -> dict[str, Any]:
+    engines = resolve_engines(args.engines, args.query, args.region, args.news)
     proxy = resolve_proxy(args.proxy)
     specs = load_cookie_specs(args.cookies)
+    specs_by_engine = {
+        engine: cookie_specs_for_engine(specs, engine) for engine in engines
+    }
     language = resolve_language(args.lang, args.region)
     started = perf_counter()
     by_engine: dict[str, list[dict[str, str]]] = {}
@@ -881,7 +1493,7 @@ def run_search(args: argparse.Namespace) -> dict[str, Any]:
                 args.region,
                 args.max_results,
                 proxy,
-                specs,
+                specs_by_engine[engine],
                 args.timeout,
                 args.backend,
                 args.news,
@@ -898,6 +1510,234 @@ def run_search(args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:  # noqa: BLE001 - preserve partial search results.
                 errors.append({"engine": engine, "error": clean_text(str(exc))})
 
+    cookie_fallbacks: dict[str, dict[str, Any]] = {}
+    manual_actions: list[dict[str, Any]] = []
+    browser_cookie_mode = getattr(args, "browser_cookies", DEFAULT_BROWSER_COOKIE_SOURCE)
+    cookie_sources = {
+        engine: "file" if specs_by_engine[engine] else "none" for engine in engines
+    }
+    cookie_counts = {
+        engine: len(specs_by_engine[engine]) for engine in engines
+    }
+
+    def accept_cookie_retry(
+        engine: str,
+        candidate_specs: list[dict[str, str]],
+        source: str,
+        backend_suffix: str,
+        fallback_info: dict[str, Any],
+    ) -> None:
+        retry_results, retry_backend = search_one(
+            engine,
+            args.query,
+            args.region,
+            args.max_results,
+            proxy,
+            candidate_specs,
+            args.timeout,
+            "html",
+            args.news,
+            language,
+        )
+        by_engine[engine] = retry_results
+        backends[engine] = f"{retry_backend}-{backend_suffix}"
+        cookie_sources[engine] = source
+        cookie_counts[engine] = len(candidate_specs)
+        errors[:] = [
+            item
+            for item in errors
+            if not (item["engine"] == engine and is_captcha_error(item["error"]))
+        ]
+        cookie_fallbacks[engine] = fallback_info
+
+    # Keep normal searches browser-free. Only enter this state machine after a
+    # positive challenge for a selected engine; an explicit --cookies file is
+    # never replaced. Cookie Editor exports are engine-specific and are tested
+    # against the live search before being written to the encrypted cache.
+    if browser_cookie_mode != "off":
+        for engine in engines:
+            # A matching explicit --cookies file is authoritative for that
+            # engine. If a shared export contains only Bing cookies, Google
+            # and Baidu may still use their own encrypted cache/export path.
+            if specs_by_engine[engine]:
+                continue
+            challenged = any(
+                item["engine"] == engine and is_captcha_error(item["error"])
+                for item in errors
+            )
+            if not challenged or by_engine.get(engine):
+                continue
+
+            cache_error = ""
+            export_error = ""
+            succeeded = False
+
+            try:
+                cache_specs, cache_info = load_cookie_cache_specs(engine)
+                accept_cookie_retry(
+                    engine,
+                    cache_specs,
+                    "cache",
+                    "cookie-cache",
+                    {**cache_info, "status": "succeeded"},
+                )
+                succeeded = True
+            except Exception as exc:  # noqa: BLE001 - continue to export refresh.
+                cache_error = clean_text(str(exc))
+                if is_captcha_error(cache_error):
+                    _delete_cookie_cache(engine)
+
+            if succeeded:
+                continue
+
+            try:
+                export_specs, export_info = load_cookie_export_specs(engine)
+                # Validate first; only a successful request may update the cache.
+                retry_results, retry_backend = search_one(
+                    engine,
+                    args.query,
+                    args.region,
+                    args.max_results,
+                    proxy,
+                    export_specs,
+                    args.timeout,
+                    "html",
+                    args.news,
+                    language,
+                )
+                cache_save_error = ""
+                try:
+                    cache_info = save_cookie_cache_specs(
+                        export_specs, export_info, engine=engine
+                    )
+                except BrowserCookieError as cache_exc:
+                    cache_info = {}
+                    cache_save_error = clean_text(str(cache_exc))
+                by_engine[engine] = retry_results
+                backends[engine] = f"{retry_backend}-cookie-export"
+                cookie_sources[engine] = "export"
+                cookie_counts[engine] = len(export_specs)
+                errors[:] = [
+                    item
+                    for item in errors
+                    if not (item["engine"] == engine and is_captcha_error(item["error"]))
+                ]
+                cookie_fallbacks[engine] = {
+                    **export_info,
+                    "status": "succeeded",
+                    "cache_saved": not bool(cache_save_error),
+                    "cache_error": cache_save_error or None,
+                    **cache_info,
+                }
+                succeeded = True
+            except Exception as exc:  # noqa: BLE001 - ask for a fresh export.
+                export_error = clean_text(str(exc))
+
+            if succeeded:
+                continue
+
+            if browser_cookie_mode == "edge" and engine == "bing":
+                try:
+                    edge_specs, edge_info = load_edge_browser_cookie_specs()
+                    retry_results, retry_backend = search_one(
+                        engine,
+                        args.query,
+                        args.region,
+                        args.max_results,
+                        proxy,
+                        edge_specs,
+                        args.timeout,
+                        "html",
+                        args.news,
+                        language,
+                    )
+                    cache_save_error = ""
+                    try:
+                        cache_info = save_cookie_cache_specs(
+                            edge_specs, edge_info, engine=engine
+                        )
+                    except BrowserCookieError as cache_exc:
+                        cache_info = {}
+                        cache_save_error = clean_text(str(cache_exc))
+                    by_engine[engine] = retry_results
+                    backends[engine] = f"{retry_backend}-edge-cookies"
+                    cookie_sources[engine] = "edge"
+                    cookie_counts[engine] = len(edge_specs)
+                    errors[:] = [
+                        item
+                        for item in errors
+                        if not (item["engine"] == engine and is_captcha_error(item["error"]))
+                    ]
+                    cookie_fallbacks[engine] = {
+                        **edge_info,
+                        "status": "succeeded",
+                        "cache_saved": not bool(cache_save_error),
+                        "cache_error": cache_save_error or None,
+                        **cache_info,
+                    }
+                    succeeded = True
+                except Exception as exc:  # noqa: BLE001 - preserve manual details.
+                    edge_error = clean_text(str(exc))
+                    lowered = edge_error.lower()
+                    waiting_for_close = (
+                        "close every edge" in lowered
+                        or "edge is running" in lowered
+                        or "used by another process" in lowered
+                        or "locked" in lowered
+                    )
+                    cookie_fallbacks[engine] = {
+                        "source": "edge",
+                        "status": "waiting_for_user" if waiting_for_close else "failed",
+                        "cookies_loaded": 0,
+                        "error": edge_error,
+                    }
+                    errors.append(
+                        {
+                            "engine": engine,
+                            "error": f"Edge cookie refresh failed: {edge_error}",
+                        }
+                    )
+
+            if succeeded:
+                continue
+
+            export_path = cookie_export_path(engine)
+            export_exists = export_path.is_file()
+            manual_reason = (
+                "cookie_export_refresh_required"
+                if export_exists
+                else "cookie_export_required"
+            )
+            cookie_fallbacks.setdefault(
+                engine,
+                {
+                    "source": "export",
+                    "status": "failed",
+                    "cookies_loaded": 0,
+                    "cache_error": cache_error or None,
+                    "export_error": export_error or None,
+                },
+            )
+            errors.append(
+                {
+                    "engine": engine,
+                    "error": (
+                        f"{engine} cookie refresh failed: "
+                        f"{export_error or cache_error or 'manual export required'}"
+                    ),
+                }
+            )
+            manual_actions.append(
+                manual_search_action(
+                    engine,
+                    args.query,
+                    args.region,
+                    args.max_results,
+                    args.news,
+                    manual_reason,
+                )
+            )
+
     results: list[dict[str, str]] = []
     seen: set[str] = set()
     for engine in engines:
@@ -907,6 +1747,15 @@ def run_search(args: argparse.Namespace) -> dict[str, Any]:
             seen.add(result["url"])
             results.append(result)
 
+    engine_results = {engine: by_engine.get(engine, []) for engine in engines}
+    complete = all(engine_results[engine] for engine in engines)
+    unique_cookie_sources = {source for source in cookie_sources.values()}
+    combined_cookie_source = (
+        next(iter(unique_cookie_sources))
+        if len(unique_cookie_sources) == 1
+        else "mixed"
+    )
+    combined_cookie_count = sum(cookie_counts.values())
     return {
         "operation": "search",
         "query": args.query,
@@ -917,7 +1766,16 @@ def run_search(args: argparse.Namespace) -> dict[str, Any]:
         "backend_mode": args.backend,
         "backends": backends,
         "proxy": {"enabled": True, "address": redact_proxy(proxy)},
-        "cookies_loaded": len(specs),
+        "complete": complete,
+        "engine_results": engine_results,
+        "cookies_loaded": combined_cookie_count,
+        "cookies_loaded_by_engine": cookie_counts,
+        "cookie_source": combined_cookie_source,
+        "cookie_sources": cookie_sources,
+        "cookie_fallbacks": cookie_fallbacks,
+        "browser_cookie_fallback": cookie_fallbacks.get("bing"),
+        "manual_actions": manual_actions,
+        "manual_action": manual_actions[0] if len(manual_actions) == 1 else None,
         "results": results,
         "errors": errors,
         "elapsed_ms": round((perf_counter() - started) * 1000),
@@ -974,18 +1832,52 @@ def extract_content(html: str, output_format: str) -> tuple[str, str]:
     return fallback_text(soup).strip(), "beautifulsoup-lxml-fallback"
 
 
+def render_with_playwright(url: str, proxy: str, timeout: float) -> tuple[str, dict[str, Any]]:
+    """Load a URL in headless Chromium, wait for JS to finish, return rendered HTML."""
+    import asyncio
+    from playwright.async_api import async_playwright
+
+    async def _render() -> tuple[str, dict[str, Any]]:
+        async with async_playwright() as p:
+            proxy_cfg = {"server": proxy} if proxy else None
+            browser = await p.chromium.launch(
+                headless=True, proxy=proxy_cfg, args=["--no-sandbox"]
+            )
+            page = await browser.new_page()
+            try:
+                resp = await page.goto(url, wait_until="networkidle", timeout=int(timeout * 1000))
+                status_code = resp.status if resp else 0
+                final_url = page.url
+                content_type = resp.headers.get("content-type", "") if resp else ""
+                html = await page.content()
+                return html, {
+                    "status_code": status_code,
+                    "final_url": final_url,
+                    "content_type": content_type,
+                    "truncated": False,
+                    "bytes": len(html),
+                }
+            finally:
+                await browser.close()
+
+    return asyncio.run(_render())
+
+
 def run_fetch(args: argparse.Namespace) -> dict[str, Any]:
     proxy = resolve_proxy(args.proxy)
     specs = load_cookie_specs(args.cookies)
     language = resolve_language(args.lang, DEFAULT_REGION)
     started = perf_counter()
-    with make_client(proxy, specs, args.timeout, language) as client:
-        html, response_info = get_html_response(
-            client,
-            args.url,
-            params={},
-            max_bytes=args.max_bytes,
-        )
+    if getattr(args, "render", False):
+        html, response_info = render_with_playwright(args.url, proxy, args.timeout)
+    else:
+        with make_client(proxy, specs, args.timeout, language) as client:
+            html, response_info = get_html_response(
+                client,
+                args.url,
+                params={},
+                max_bytes=args.max_bytes,
+            )
     soup = BeautifulSoup(html, "lxml")
     metadata = page_metadata(soup, response_info["final_url"])
     content, method = extract_content(html, args.format)
@@ -1040,8 +1932,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("query", help="Search query")
     parser.add_argument(
         "--engines",
-        default=os.getenv("WEBSEARCH_ENGINES", DEFAULT_ENGINES),
-        help="Comma-separated engines: bing,google,baidu",
+        default=None,
+        help=(
+            "Comma-separated engines: bing,duckduckgo,baidu. Default is Bing+DuckDuckGo; "
+            "Baidu is added automatically for Chinese/China-related queries"
+        ),
     )
     parser.add_argument(
         "--region",
@@ -1065,6 +1960,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use Bing News; defaults to the Bing engine only",
     )
+    parser.add_argument(
+        "--browser-cookies",
+        choices=SUPPORTED_BROWSER_COOKIE_SOURCES,
+        default=os.getenv("WEBSEARCH_BROWSER_COOKIES", DEFAULT_BROWSER_COOKIE_SOURCE),
+        help=(
+            "After a challenge, use the encrypted cache then Cookie Editor export "
+            "(auto); use edge for legacy closed-Edge import or off to disable"
+        ),
+    )
     add_network_options(parser)
     return parser
 
@@ -1087,10 +1991,10 @@ def main() -> int:
             raise WebSearchError("--max-results must be at least 1")
         payload = run_search(args)
         emit(payload, args.pretty)
-        return 0 if payload["results"] else 1
+        return 0
     except Exception as exc:  # noqa: BLE001 - CLI must return machine-readable errors.
         emit({"error": clean_text(str(exc)), "operation": "search"}, args.pretty)
-        return 1
+        return 0
 
 
 if __name__ == "__main__":

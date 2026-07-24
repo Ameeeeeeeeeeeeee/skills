@@ -34,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=env_int("WEBSEARCH_MAX_BYTES", DEFAULT_MAX_BYTES),
         help="Maximum response bytes to read",
     )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Render JavaScript with headless Chromium before extracting content",
+    )
     add_network_options(parser)
     return parser
 
