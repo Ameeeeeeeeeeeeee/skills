@@ -81,8 +81,8 @@ DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_CHARS = 30_000
 DEFAULT_COOKIE_CACHE_MAX_AGE = 7 * 24 * 60 * 60
 # Cookie exports and the encrypted cache live in a shared cache directory beside
-# the skill folders (../cache relative to this skill); keep it out of version control.
-CACHE_ROOT = Path(__file__).resolve().parents[2] / "cache"
+# the skills repository (../../cache relative to this skill), outside version control.
+CACHE_ROOT = Path(__file__).resolve().parents[3] / "cache"
 COOKIE_CACHE_MAGIC = b"WEBSEARCH-BING-COOKIE-CACHE-V1\n"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
