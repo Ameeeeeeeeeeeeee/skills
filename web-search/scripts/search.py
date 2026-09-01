@@ -80,6 +80,9 @@ DEFAULT_MAX_RESULTS = 5
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_CHARS = 30_000
 DEFAULT_COOKIE_CACHE_MAX_AGE = 7 * 24 * 60 * 60
+# Cookie exports and the encrypted cache live in a shared cache directory beside
+# the skill folders (../cache relative to this skill); keep it out of version control.
+CACHE_ROOT = Path(__file__).resolve().parents[2] / "cache"
 COOKIE_CACHE_MAGIC = b"WEBSEARCH-BING-COOKIE-CACHE-V1\n"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -327,7 +330,7 @@ def _dpapi_protect(value: bytes) -> bytes:
 
 
 def cookie_cache_path(engine: str = "bing") -> Path:
-    """Return an engine-specific cache path outside the Skill repository."""
+    """Return an engine-specific cache path beside the skills directory."""
 
     if engine not in COOKIE_CACHE_ENGINES:
         raise BrowserCookieError(f"Cookie cache is not supported for {engine}")
@@ -336,13 +339,7 @@ def cookie_cache_path(engine: str = "bing") -> Path:
         configured = configured or os.getenv("WEBSEARCH_COOKIE_CACHE")
     if configured:
         return Path(configured).expanduser()
-    return (
-        Path.home()
-        / ".agents"
-        / "cache"
-        / "web-search"
-        / f"{engine}-cookies.dpapi"
-    )
+    return CACHE_ROOT / f"{engine}-cookies.dpapi"
 
 
 def cookie_export_path(engine: str = "bing") -> Path:
@@ -1272,10 +1269,21 @@ def search_arxiv_api(
         "sortOrder": "descending",
     }
     with make_client(proxy, [], timeout) as client:
-        response = client.get(
-            "https://export.arxiv.org/api/query",
-            params=params,
-            headers={"Accept": "application/atom+xml, text/xml"},
+        # arXiv throttles by IP and asks for one request every 3 seconds; retry
+        # transient throttling once before giving up.
+        for attempt in (1, 2):
+            response = client.get(
+                "https://export.arxiv.org/api/query",
+                params=params,
+                headers={"Accept": "application/atom+xml, text/xml"},
+            )
+            if response.status_code not in {429, 500, 502, 503} or attempt == 2:
+                break
+            time.sleep(3.5)
+    if response.status_code == 429:
+        raise WebSearchError(
+            "arXiv API rate limit exceeded (HTTP 429); arXiv throttles by IP — "
+            "wait roughly a minute and rerun the search"
         )
     if response.status_code != 200:
         raise WebSearchError(f"arXiv API returned HTTP {response.status_code}")
@@ -1329,11 +1337,16 @@ def search_github_api(
     if token:
         headers["Authorization"] = f"Bearer {token}"
     with make_client(proxy, [], timeout) as client:
-        response = client.get(
-            "https://api.github.com/search/repositories",
-            params={"q": terms, "per_page": str(max_results)},
-            headers=headers,
-        )
+        # Retry transient server errors once; rate-limit answers will not recover.
+        for attempt in (1, 2):
+            response = client.get(
+                "https://api.github.com/search/repositories",
+                params={"q": terms, "per_page": str(max_results)},
+                headers=headers,
+            )
+            if response.status_code not in {429, 500, 502, 503} or attempt == 2:
+                break
+            time.sleep(2.0)
     if response.status_code in {403, 429}:
         hint = (
             "set GITHUB_TOKEN or GH_TOKEN"
@@ -1563,6 +1576,12 @@ def manual_search_action(
     if engine == "baidu":
         base_url = "https://www.baidu.com/s"
         params = {"wd": query, "rn": str(max_results), "ie": "utf-8"}
+    elif engine == "arxiv":
+        base_url = "https://arxiv.org/search/"
+        params = {"query": query, "searchtype": "all"}
+    elif engine == "github":
+        base_url = "https://github.com/search"
+        params = {"q": query, "type": "repositories"}
     elif news:
         base_url = "https://www.bing.com/news/search"
         params = {"q": query, "setlang": language or "en", "cc": country}
@@ -1573,7 +1592,10 @@ def manual_search_action(
             "count": str(max_results),
             "setlang": language or "en",
         }
-    export_path = cookie_export_path(engine)
+    # Only cookie-managed engines have an export path; API engines have none.
+    export_path = (
+        cookie_export_path(engine) if engine in COOKIE_CACHE_ENGINES else ""
+    )
     if reason == "cookie_export_required":
         phase = "export_cookie"
         instructions = (
@@ -1585,10 +1607,16 @@ def manual_search_action(
     elif reason == "cookie_export_refresh_required":
         phase = "authenticate_then_export"
         instructions = (
-            f"The cached {engine} cookies were rejected. Open this URL in Edge, "
-            f"complete the CAPTCHA or consent step manually, overwrite {export_path} "
-            "with a fresh Cookie Editor JSON or Netscape export, and rerun the same "
-            "search. Do not paste cookie values."
+            f"The cached {engine} cookies expired or were rejected. Open this URL "
+            f"in Edge, complete the CAPTCHA or consent step manually, overwrite "
+            f"{export_path} with a fresh Cookie Editor JSON or Netscape export, and "
+            "rerun the same search. Do not paste cookie values."
+        )
+    elif reason == "api_engine_failed":
+        phase = "manual_result_handoff"
+        instructions = (
+            f"The {engine} API failed after retries. Open this URL in a browser to "
+            "collect the results manually, or rerun the search later."
         )
     elif reason == "bing_cookie_refresh_close_edge":
         phase = "close_edge"
@@ -1889,6 +1917,21 @@ def run_search(args: argparse.Namespace) -> dict[str, Any]:
                     args.max_results,
                     args.news,
                     manual_reason,
+                )
+            )
+
+    # API engines have no cookie workflow; surface a browser fallback URL instead.
+    for error_item in errors:
+        engine = error_item["engine"]
+        if engine in API_ENGINES and not by_engine.get(engine):
+            manual_actions.append(
+                manual_search_action(
+                    engine,
+                    args.query,
+                    args.region,
+                    args.max_results,
+                    args.news,
+                    "api_engine_failed",
                 )
             )
 

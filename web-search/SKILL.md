@@ -45,16 +45,20 @@ conda run --no-capture-output -n skills python <skill-dir>/scripts/fetch.py "htt
 
 ## Cookie workflow and required user intervention
 
+Cookies are optional: most searches succeed without any cookie because Bing tolerates anonymous traffic, so do not prompt the user to configure cookies up front. Configure them only after an engine starts returning challenges. Cookie Editor is a browser extension — install it from the Edge Add-ons store (or the Chrome/Firefox extension stores) before the first export.
+
 Normal searches do not open or control Edge. Every search-engine request still goes through the configured Clash proxy.
 
 When an engine returns a CAPTCHA, consent, or anti-bot challenge, use this state machine:
 
 1. Search without cookies.
-2. Load that engine's encrypted Windows-DPAPI cache from `~/.agents/cache/web-search/<engine>-cookies.dpapi`.
-3. If the cache is absent, expired, undecipherable, or rejected by the engine, look for a Cookie Editor export at `~/.agents/cache/web-search/<engine>.json`. A successful live retry saves a new encrypted cache, so later searches do not require Edge or user clicks.
+2. Load that engine's encrypted cache from `../cache/<engine>-cookies.dpapi` — the `cache` directory beside the skill folders.
+3. If the cache is absent, expired, undecipherable, or rejected by the engine, look for a Cookie Editor export at `../cache/<engine>.json`. A successful live retry saves a new encrypted cache, so later searches do not require Edge or user clicks.
 4. If the export is missing, invalid, or rejected, the JSON response contains `manual_actions` and `complete: false`. This is a hard user-intervention state: tell the user exactly which engine needs a fresh export, the exact path, and the supplied URL; ask the user to open it in Edge, complete the CAPTCHA/consent/login, export with Cookie Editor, save/overwrite that file, and confirm. Then rerun the original search. Never claim the search succeeded while `complete` is false.
 
 Do not ask the user to perform this on every search. Manual intervention is needed only when a cache is missing or no longer accepted. The script never kills Edge and never prints cookie values.
+
+Encrypted caches expire after 7 days by default (`WEBSEARCH_COOKIE_CACHE_MAX_AGE`). When a cache expires and the engine challenges again, the response's `manual_actions` reminds the user to export fresh cookies. The encrypted cache uses Windows DPAPI; on other platforms the plain JSON export is re-used directly on every challenge. The `cache` directory is gitignored — keep raw cookie exports out of the repository.
 
 Cookie Editor JSON is preferred; Netscape `cookies.txt` is also accepted. Header-string exports and encrypted `E2EE_...` exports are not accepted. Treat raw exports as bearer credentials: do not paste them into chat, commit them, or put them in the Skill repository. After the encrypted cache is successfully created, the user may delete the raw JSON export if they want the cache to be the only copy.
 
@@ -91,6 +95,12 @@ Install dependencies once in the dedicated environment:
 ```text
 conda create -n skills python=3.13 -y
 conda run --no-capture-output -n skills python -m pip install -r <skill-dir>/requirements.txt
+```
+
+`fetch.py --render` also needs the headless Chromium browser, installed once with:
+
+```text
+conda run --no-capture-output -n skills python -m playwright install chromium
 ```
 
 The proxy is resolved in this order: `--proxy`, `WEBSEARCH_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, then `http://127.0.0.1:7897`. HTTPX disables ambient environment bypasses for its own clients, so selected requests go through Clash and Clash decides rule-based routing.

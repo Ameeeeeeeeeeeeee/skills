@@ -1,6 +1,8 @@
-ddgs==9.14.4
-httpx>=0.27,<1
-trafilatura>=1.12,<3
-beautifulsoup4>=4.12,<5
-lxml>=5.3,<7
-cryptography>=42,<47
+# ddgs: the force-enabled Bing engine reaches into ddgs internals; stay within 9.x.
+ddgs>=9.14,<10
+httpx>=0.27
+playwright
+trafilatura
+beautifulsoup4
+lxml
+cryptography

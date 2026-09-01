@@ -12,6 +12,7 @@ Use this skill for the manual daily arXiv computer-science digest workflow under
 - Prefer manual interactive runs over Codex UI automation when fresh network access matters.
 - The UI automation path has shown DNS failures reaching `arxiv.org`; treat it as unreliable for fetching.
 - The examples below assume the skill is installed at `${CODEX_HOME:-$HOME/.codex}/skills/arxiv-cs-digest`. If your Python runner is not `conda run -n hybrid python`, keep the same script path and swap only the launcher.
+- The `hybrid` environment needs Python ≥ 3.11 plus the packages in `requirements.txt`: `conda run -n hybrid python -m pip install -r <skill-dir>/requirements.txt`.
 - In a manual session, start with the script's `doctor` output. If `doctor` shows that `.codex/...` is not writable or `arxiv.org` is not reachable inside the sandbox, rerun the exact `scripts/run_digest.py` command with elevated permissions instead of debugging the parser.
 - `arXiv` pages are public. No browser cookie is needed for `cs/new`, `abs`, `html`, or `pdf` access.
 

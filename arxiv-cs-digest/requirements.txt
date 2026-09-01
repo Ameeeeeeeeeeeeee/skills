@@ -1,0 +1,4 @@
+# Python >= 3.11 required: run_digest.py uses tomllib from the standard library.
+requests
+beautifulsoup4
+pypdf
