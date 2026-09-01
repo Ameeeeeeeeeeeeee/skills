@@ -1,6 +1,6 @@
 ---
 name: web-search
-description: Search the public web and fetch readable page content through the bundled Python scripts in the Conda environment `skills`, routed through Clash. Use for current information, web research, source verification, search results, news, or the contents of a URL. Search Bing and DuckDuckGo by default, add Baidu automatically for Chinese or China-related queries, and use the per-engine encrypted Cookie Editor cache only when a challenge requires it.
+description: Search the public web and fetch readable page content through the bundled Python scripts in the Conda environment `skills`, routed through Clash. Use for current information, web research, source verification, search results, news, or the contents of a URL. Search Bing and DuckDuckGo by default, add Baidu automatically for Chinese or China-related queries, query arXiv and GitHub through their official APIs when the query names those sites, and use the per-engine encrypted Cookie Editor cache only when a challenge requires it.
 ---
 
 # Web Search
@@ -26,6 +26,8 @@ Parse the UTF-8 JSON before answering. Search results contain `title`, `url`, `s
 - `--max-results` applies to each selected engine. `--region` defaults to `cn-zh`; use `--region us-en` and an English `--lang` for international results.
 - `--backend auto` tries DDGS and then the direct HTTPX HTML adapter. `--backend html` skips DDGS. Bing text DDGS is deliberately force-enabled at runtime, and the HTML path remains available if DDGS fails.
 - `--news` is Bing-only; use `--engines bing` explicitly when needed.
+- `arxiv` and `github` are API engines: they call the arXiv export API and the GitHub REST search API directly — never scraping and never routed through Bing/DuckDuckGo. Use `--engines arxiv` or `--engines github` alone to search only that source; queries that mention arxiv/github (or use `site:arxiv.org`/`site:github.com`) add the matching API engine automatically alongside the web engines.
+- GitHub search accepts GitHub qualifiers, e.g. `"attention pytorch language:python stars:>1000"`. Unauthenticated GitHub search is rate-limited (about 10 requests/minute); set `GITHUB_TOKEN` or `GH_TOKEN` to raise the limit. arXiv results link to `arxiv.org/abs` pages — fetch one for the full abstract.
 - Preserve result URLs and fetch important source pages before citing them. A snippet is not proof.
 - For complex research tasks: search → fetch → reflect → repeat. After each cycle, identify what information is still missing and formulate a new targeted query rather than repeating similar synonyms. If a page returns minimal content (JS-rendered, paywalled), retry with `--render` or find an alternative source.
 
@@ -36,6 +38,8 @@ conda run --no-capture-output -n skills python <skill-dir>/scripts/search.py "Op
 conda run --no-capture-output -n skills python <skill-dir>/scripts/search.py "中国人工智能政策" --max-results 5 --pretty
 conda run --no-capture-output -n skills python <skill-dir>/scripts/search.py "Anthropic" --news --engines bing --region us-en --max-results 5 --pretty
 conda run --no-capture-output -n skills python <skill-dir>/scripts/search.py "query" --engines duckduckgo --pretty
+conda run --no-capture-output -n skills python <skill-dir>/scripts/search.py "diffusion models image generation" --engines arxiv --max-results 5 --pretty
+conda run --no-capture-output -n skills python <skill-dir>/scripts/search.py "fastapi language:python stars:>10000" --engines github --max-results 5 --pretty
 conda run --no-capture-output -n skills python <skill-dir>/scripts/fetch.py "https://example.com/spa" --render --format markdown --pretty
 ```
 

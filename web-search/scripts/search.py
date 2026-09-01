@@ -30,7 +30,7 @@ import trafilatura
 
 # DDGS is not thread-safe; serialize all DDGS calls through this lock.
 _ddgs_lock = threading.Lock()
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, FeatureNotFound
 
 try:
     from ddgs import DDGS
@@ -64,8 +64,9 @@ def force_enable_ddgs_bing() -> bool:
     return True
 
 
-SUPPORTED_ENGINES = ("bing", "duckduckgo", "baidu")
+SUPPORTED_ENGINES = ("bing", "duckduckgo", "baidu", "arxiv", "github")
 COOKIE_CACHE_ENGINES = ("bing", "baidu")
+API_ENGINES = ("arxiv", "github")
 SUPPORTED_BACKENDS = ("auto", "ddgs", "html")
 SUPPORTED_BROWSER_COOKIE_SOURCES = ("off", "auto", "edge")
 DEFAULT_ENGINES = "bing,duckduckgo"
@@ -1252,6 +1253,131 @@ def search_news_one(
         )
 
 
+def search_arxiv_api(
+    query: str,
+    max_results: int,
+    proxy: str,
+    timeout: float,
+) -> list[dict[str, str]]:
+    """Search arXiv through the official Atom export API: no scraping or cookies."""
+
+    terms = " ".join(query.split())
+    if not terms:
+        raise WebSearchError("arxiv engine requires a non-empty query")
+    params = {
+        "search_query": f"all:{terms}",
+        "start": "0",
+        "max_results": str(max_results),
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    }
+    with make_client(proxy, [], timeout) as client:
+        response = client.get(
+            "https://export.arxiv.org/api/query",
+            params=params,
+            headers={"Accept": "application/atom+xml, text/xml"},
+        )
+    if response.status_code != 200:
+        raise WebSearchError(f"arXiv API returned HTTP {response.status_code}")
+    try:
+        soup = BeautifulSoup(response.text, "xml")
+    except FeatureNotFound:
+        soup = BeautifulSoup(response.text, "html.parser")
+
+    results: list[dict[str, str]] = []
+    for entry in soup.find_all("entry"):
+        id_node = entry.find("id")
+        if id_node is None:
+            continue
+        title_node = entry.find("title")
+        summary_node = entry.find("summary")
+        authors = [name.get_text(" ", strip=True) for name in entry.find_all("name")]
+        author_text = ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else "")
+        published_node = entry.find("published")
+        published = published_node.get_text(strip=True)[:10] if published_node else ""
+        summary = " ".join(summary_node.get_text().split()) if summary_node else ""
+        prefix = " · ".join(part for part in (published, author_text) if part)
+        snippet = f"[{prefix}] {summary[:400]}".strip() if prefix else summary[:400]
+        result = make_result(
+            title_node.get_text(" ", strip=True) if title_node else "",
+            id_node.get_text(strip=True),
+            snippet,
+            "arxiv",
+            "https://arxiv.org",
+        )
+        if result:
+            results.append(result)
+    return results
+
+
+def search_github_api(
+    query: str,
+    max_results: int,
+    proxy: str,
+    timeout: float,
+) -> list[dict[str, str]]:
+    """Search GitHub repositories through the REST search API: no scraping or cookies."""
+
+    terms = " ".join(query.split())
+    if not terms:
+        raise WebSearchError("github engine requires a non-empty query")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    with make_client(proxy, [], timeout) as client:
+        response = client.get(
+            "https://api.github.com/search/repositories",
+            params={"q": terms, "per_page": str(max_results)},
+            headers=headers,
+        )
+    if response.status_code in {403, 429}:
+        hint = (
+            "set GITHUB_TOKEN or GH_TOKEN"
+            if not token
+            else "wait for the rate-limit window to reset"
+        )
+        raise WebSearchError(
+            f"GitHub API rate limit exceeded (HTTP {response.status_code}); {hint}"
+        )
+    if response.status_code != 200:
+        raise WebSearchError(
+            f"GitHub API returned HTTP {response.status_code}: "
+            f"{clean_text(response.text[:200])}"
+        )
+
+    payload = response.json()
+    results: list[dict[str, str]] = []
+    for item in payload.get("items", []):
+        description = " ".join((item.get("description") or "").split())
+        updated = (item.get("updated_at") or "")[:10]
+        stars = item.get("stargazers_count")
+        language = item.get("language") or ""
+        meta = " · ".join(
+            part
+            for part in (
+                f"{stars} stars" if stars is not None else "",
+                language,
+                f"updated {updated}" if updated else "",
+            )
+            if part
+        )
+        snippet = f"{meta} — {description}" if meta and description else (meta or description)
+        result = make_result(
+            item.get("full_name") or "",
+            item.get("html_url") or "",
+            snippet,
+            "github",
+            "https://github.com",
+        )
+        if result:
+            results.append(result)
+    return results
+
+
 def search_one(
     engine: str,
     query: str,
@@ -1276,6 +1402,12 @@ def search_one(
             backend_mode,
             language,
         )
+
+    # arXiv and GitHub use official APIs: no cookies, no HTML scraping, no challenges.
+    if engine == "arxiv":
+        return search_arxiv_api(query, max_results, proxy, timeout), "arxiv-api"
+    if engine == "github":
+        return search_github_api(query, max_results, proxy, timeout), "github-api"
 
     # DuckDuckGo always uses DDGS natively — no cookies or HTML fallback.
     if engine == "duckduckgo":
@@ -1356,6 +1488,20 @@ def query_is_chinese_or_china_related(query: str) -> bool:
     )
 
 
+def query_mentions_api_engines(query: str) -> list[str]:
+    """Select arxiv/github when the query names those sites or filters to them."""
+
+    lowered = query.casefold()
+    engines = []
+    for engine, markers in (
+        ("arxiv", ("arxiv", "site:arxiv.org")),
+        ("github", ("github", "site:github.com")),
+    ):
+        if any(marker in lowered for marker in markers):
+            engines.append(engine)
+    return engines
+
+
 def resolve_engines(
     configured: str | None,
     query: str,
@@ -1371,6 +1517,11 @@ def resolve_engines(
         engines = ["bing", "duckduckgo"]
         if query_is_chinese_or_china_related(query):
             engines.append("baidu")
+        engines.extend(
+            engine
+            for engine in query_mentions_api_engines(query)
+            if engine not in engines
+        )
 
     if news:
         if configured and engines != ["bing"]:
@@ -1556,6 +1707,9 @@ def run_search(args: argparse.Namespace) -> dict[str, Any]:
     # against the live search before being written to the encrypted cache.
     if browser_cookie_mode != "off":
         for engine in engines:
+            # API engines never hit CAPTCHAs and have no cookie workflow.
+            if engine in API_ENGINES:
+                continue
             # A matching explicit --cookies file is authoritative for that
             # engine. If a shared export contains only Bing cookies, Google
             # and Baidu may still use their own encrypted cache/export path.
@@ -1934,8 +2088,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--engines",
         default=None,
         help=(
-            "Comma-separated engines: bing,duckduckgo,baidu. Default is Bing+DuckDuckGo; "
-            "Baidu is added automatically for Chinese/China-related queries"
+            "Comma-separated engines: bing,duckduckgo,baidu,arxiv,github. Default is "
+            "Bing+DuckDuckGo; Baidu is added automatically for Chinese/China-related "
+            "queries and arxiv/github when the query names those sites"
         ),
     )
     parser.add_argument(
