@@ -1,0 +1,4 @@
+interface:
+  display_name: "arXiv CS Digest"
+  short_description: "手动运行并整理 arXiv CS 每日早报"
+  default_prompt: "Use $arxiv-cs-digest. Start with doctor and status, then run the manual daily digest workflow, preferring 5-10 strong papers and writing the final Chinese markdown report with source-grounded author and unit metadata."

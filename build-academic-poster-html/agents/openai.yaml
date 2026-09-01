@@ -1,0 +1,4 @@
+interface:
+  display_name: "Academic Poster HTML"
+  short_description: "Build adaptable print-size academic posters in HTML"
+  default_prompt: "Use $build-academic-poster-html to create or refine an academic poster in my requested dimensions from my paper materials."

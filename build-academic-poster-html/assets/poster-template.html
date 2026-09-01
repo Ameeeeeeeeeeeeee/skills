@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>[SHORT PAPER TITLE] — Academic Poster</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+
+  :root {
+    /* Change these first. Also update the explicit @page size below. */
+    --poster-width: 100cm;
+    --poster-height: 75cm;
+    --header-height: 11.1%;
+    --footer-height: 2.0%;
+
+    --navy: #112f50;
+    --navy-2: #1c4d79;
+    --blue: #2c72ad;
+    --sky: #eaf4fb;
+    --ink: #172433;
+    --muted: #526477;
+    --line: #d4e0ea;
+    --panel: #f4f8fb;
+    --red: #bb574f;
+    --red-bg: #fff1ef;
+    --green: #2d8666;
+    --green-bg: #edf8f3;
+    --gold: #bd7a1d;
+    --gold-bg: #fff7e8;
+    --purple: #6c57a4;
+    --purple-bg: #f3effb;
+    --content: #b8c8e7;
+    --residual: #bde0d7;
+    --caption: #cbb7d7;
+    --logic: #b6ccdc;
+  }
+
+  body {
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 18px 0;
+    background: #dfe5ea;
+    color: var(--ink);
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+
+  .poster {
+    position: relative;
+    width: var(--poster-width);
+    height: var(--poster-height);
+    overflow: hidden;
+    container-type: size;
+    background: #fff;
+    box-shadow: 0 8px 42px rgba(17, 47, 80, .18);
+  }
+
+  .header {
+    position: absolute;
+    inset: 0 0 auto;
+    height: var(--header-height);
+    display: flex;
+    flex-direction: column;
+    padding: clamp(12px, .92cqmin, 32px) clamp(24px, 1.84cqmin, 64px) clamp(8px, .53cqmin, 20px);
+    overflow: hidden;
+    color: #fff;
+    background: linear-gradient(122deg, #102b49 0%, #174269 50%, #2e73ab 100%);
+  }
+
+  .header-main {
+    position: relative;
+    z-index: 1;
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 21%);
+    gap: clamp(18px, 1.2cqmin, 42px);
+    align-items: center;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(34pt, 2.35cqmin, 64pt);
+    line-height: 1.05;
+    font-weight: 800;
+    letter-spacing: -.025em;
+    white-space: nowrap;
+  }
+
+  .subtitle {
+    margin-top: clamp(6px, .46cqmin, 16px);
+    color: #d9edf9;
+    font-size: clamp(16pt, .99cqmin, 28pt);
+    line-height: 1.2;
+  }
+
+  .headline-metric {
+    border-left: 4px solid rgba(255,255,255,.6);
+    padding-left: clamp(12px, .92cqmin, 30px);
+  }
+
+  .headline-metric .eyebrow {
+    color: #bfe2fb;
+    font-size: clamp(14pt, .85cqmin, 22pt);
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  .headline-metric strong {
+    display: block;
+    margin: .16em 0 .08em;
+    font-size: clamp(30pt, 2.12cqmin, 56pt);
+    line-height: 1;
+  }
+
+  .headline-metric span {
+    display: block;
+    color: #e4f3fc;
+    font-size: clamp(14pt, .87cqmin, 22pt);
+    line-height: 1.25;
+    white-space: nowrap;
+  }
+
+  .header-meta {
+    position: relative;
+    z-index: 1;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 1.32fr 1fr;
+    gap: clamp(16px, 1cqmin, 34px);
+    align-items: stretch;
+    margin-top: clamp(6px, .42cqmin, 14px);
+    padding-top: clamp(5px, .32cqmin, 11px);
+    border-top: 1px solid rgba(255,255,255,.25);
+  }
+
+  .header-meta > div {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+
+  .header-authors { align-items: flex-start; padding-bottom: .42cqmin; }
+  .authors { font-size: clamp(15pt, .94cqmin, 24pt); font-weight: 650; line-height: 1.2; }
+  .affiliations { margin-top: .08em; color: #cfe5f3; font-size: clamp(14pt, .85cqmin, 21pt); line-height: 1.2; }
+  .resources { align-items: flex-end; padding-top: .18cqmin; font-size: clamp(14pt, .89cqmin, 22pt); }
+  .resources a { display: inline-flex; align-items: center; gap: .32cqmin; color: #fff; text-decoration: none; font-weight: 750; }
+  .resources svg { width: clamp(28px, 1.34cqmin, 44px); height: clamp(28px, 1.34cqmin, 44px); fill: currentColor; }
+
+  .body {
+    position: absolute;
+    inset: var(--header-height) 0 var(--footer-height);
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 30.5fr 39fr 30.5fr;
+    gap: clamp(14px, .78cqmin, 28px);
+    padding: clamp(14px, .78cqmin, 28px) clamp(18px, .99cqmin, 36px) clamp(10px, .56cqmin, 20px);
+    overflow: hidden;
+  }
+
+  .poster.layout-wide .body { grid-template-columns: 28fr 44fr 28fr; }
+
+  .column {
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .column-center {
+    padding: 0 clamp(12px, .78cqmin, 26px);
+    border-left: 2px solid var(--line);
+    border-right: 2px solid var(--line);
+  }
+
+  .section { min-width: 0; flex: 0 0 auto; }
+
+  .section-title {
+    display: flex;
+    align-items: center;
+    gap: clamp(7px, .39cqmin, 13px);
+    min-height: 1.5em;
+    margin: 0 0 clamp(8px, .53cqmin, 17px);
+    padding-bottom: .25em;
+    border-bottom: 4px solid var(--blue);
+    color: var(--navy);
+    font-size: clamp(20pt, 1.32cqmin, 34pt);
+    line-height: 1.05;
+    font-weight: 800;
+    white-space: nowrap;
+  }
+
+  .section-icon { flex: 0 0 auto; font-size: .96em; line-height: 1; font-weight: 400; }
+  p { margin: 0; color: var(--ink); font-size: clamp(17pt, 1.01cqmin, 27pt); line-height: 1.4; }
+  .small { color: var(--muted); font-size: clamp(15pt, .87cqmin, 22pt); line-height: 1.34; }
+  sup, sub { font-size: .66em; line-height: 0; font-weight: 400; font-style: italic; }
+
+  .panel {
+    padding: clamp(9px, .53cqmin, 18px) clamp(10px, .6cqmin, 20px);
+    border: 2px solid #e1e9f0;
+    border-radius: clamp(7px, .42cqmin, 14px);
+    background: var(--panel);
+  }
+
+  .abstract-panel { border-left: 8px solid var(--blue); background: linear-gradient(135deg, #f4f8fb, #eaf4fb); }
+
+  .problem-grid, .metric-row, .formula-grid, .data-grid, .ablation-grid {
+    display: grid;
+    gap: clamp(7px, .36cqmin, 13px);
+  }
+
+  .problem-grid, .data-grid, .ablation-grid { grid-template-columns: 1fr 1fr; }
+  .metric-row, .formula-grid { grid-template-columns: repeat(3, 1fr); }
+
+  .problem-card, .data-card, .formula-card, .ablation-card {
+    min-width: 0;
+    padding: clamp(8px, .46cqmin, 15px);
+    border: 2px solid var(--line);
+    border-radius: clamp(7px, .38cqmin, 12px);
+    background: #fff;
+  }
+
+  .problem-card.bad { border-color: #efc1bd; background: var(--red-bg); }
+  .problem-card.good { border-color: #b9dece; background: var(--green-bg); }
+  h3, h4 { margin: 0 0 .3em; color: var(--navy); font-size: clamp(16pt, .94cqmin, 24pt); line-height: 1.15; }
+  ul { margin: 0; padding-left: 1.3em; }
+  li { margin: .12em 0; color: #37495a; font-size: clamp(15pt, .87cqmin, 22pt); line-height: 1.3; }
+
+  .ideal-strip {
+    display: flex;
+    align-items: baseline;
+    gap: .9em;
+    margin-top: .38cqmin;
+    padding: .38cqmin .5cqmin;
+    border-radius: .34cqmin;
+    background: var(--navy);
+    color: #fff;
+    font-size: clamp(15pt, .87cqmin, 22pt);
+    line-height: 1.25;
+    white-space: nowrap;
+  }
+  .ideal-strip b { color: #bfe3fb; font-size: 1.05em; }
+
+  .contrib-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: .36cqmin; }
+  .contrib-list li { position: relative; min-height: 4em; margin: 0; padding: .44cqmin .46cqmin .4cqmin 2.2cqmin; border: 2px solid #e0e8ef; border-radius: .36cqmin; background: #f7fafc; }
+  .contrib-list strong { display: block; margin-bottom: .12em; color: var(--navy); }
+  .num { position: absolute; left: .43cqmin; top: .43cqmin; width: 1.34cqmin; height: 1.34cqmin; display: grid; place-items: center; border-radius: 50%; background: var(--blue); color: #fff; font-size: clamp(12pt, .7cqmin, 18pt); font-weight: 800; }
+
+  .figure-placeholder {
+    min-height: 15cqmin;
+    display: grid;
+    place-items: center;
+    border: 2px dashed #aebdca;
+    border-radius: .38cqmin .38cqmin 0 0;
+    background: #fff;
+    color: var(--muted);
+    font-size: clamp(16pt, .9cqmin, 23pt);
+  }
+  .figure-caption { padding: .4cqmin .5cqmin; border: 2px solid var(--line); border-top: 0; border-radius: 0 0 .38cqmin .38cqmin; color: var(--muted); font-size: clamp(15pt, .89cqmin, 22pt); line-height: 1.34; }
+  .figure-caption b { color: var(--navy); font-size: 1.1em; }
+
+  .workflow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: .25cqmin; }
+  .workflow-step { min-width: 0; display: grid; place-items: center; min-height: 2.8cqmin; padding: .3cqmin; border: 2px solid var(--line); border-radius: .32cqmin; background: #fff; text-align: center; color: var(--muted); font-size: clamp(15pt, .87cqmin, 22pt); }
+  .workflow-step b { display: block; color: var(--navy); }
+  .arrow { display: grid; place-items: center; color: var(--blue); font-size: clamp(22pt, 1.35cqmin, 36pt); font-weight: 900; }
+
+  .arch-board { padding: .55cqmin; border: 2px solid #dbe5ec; border-radius: .42cqmin; background: #f5f8fa; }
+  .stage { padding: .38cqmin .5cqmin; border: 2px solid; border-radius: .32cqmin; text-align: center; color: var(--navy); font-size: clamp(16pt, .94cqmin, 24pt); font-weight: 800; }
+  .stage span { display: block; margin-top: .12em; color: var(--muted); font-size: .84em; font-weight: 500; }
+  .stage.audio { border-color: #ddaaa4; background: #f5d9d6; }
+  .stage.codec { border-color: #adc98e; background: #e2edcf; }
+  .stage.encoder { border-color: #db9b95; background: #efd1ce; }
+  .stage.output { border-color: #173e65; background: #173e65; color: #fff; }
+  .stage.output span { color: #e1eef7; }
+  .connector { min-height: 1.3cqmin; display: grid; place-items: center; color: #64798b; font-size: clamp(14pt, .78cqmin, 20pt); }
+  .connector::before { content: "↓"; margin-right: .25em; color: #75899a; font-size: 1.25em; font-weight: 800; }
+
+  .streams, .heads { display: grid; gap: .34cqmin; }
+  .streams { grid-template-columns: 1fr 1fr; }
+  .heads { grid-template-columns: repeat(3, 1fr); }
+  .stream-card, .head-card { padding: .4cqmin; border: 2px dashed #7d8d9b; border-radius: .34cqmin; background: #fff; text-align: center; color: var(--navy); font-size: clamp(15pt, .88cqmin, 22pt); font-weight: 800; }
+  .head-card:nth-child(1) { background: #d9e2f3; border-style: solid; border-color: #728fbd; }
+  .head-card:nth-child(2) { background: #e3d7e8; border-style: solid; border-color: #9a78aa; }
+  .head-card:nth-child(3) { background: #d8e6ee; border-style: solid; border-color: #7595aa; }
+
+  .token-row { display: flex; align-items: center; justify-content: center; gap: .16cqmin; margin-top: .25cqmin; }
+  .token { width: 1.02cqmin; height: .82cqmin; border: 1.5px solid rgba(17,47,80,.34); border-radius: .14cqmin; background: var(--content); }
+  .token.res { height: .55cqmin; background: var(--residual); }
+  .token.cap { background: var(--caption); }
+  .token.logic { background: var(--logic); }
+  .token.off { width: .34cqmin; height: 1.4cqmin; background: #fff; border-color: #b9c8d3; box-shadow: 0 0 0 .6px rgba(87,108,124,.11); }
+  .token.active { width: .34cqmin; height: 1.4cqmin; box-shadow: 0 0 0 .6px rgba(17,47,80,.16); }
+  .token.hatch-a { background-image: repeating-linear-gradient(135deg, transparent 0 5px, rgba(39,64,95,.24) 5px 7px, transparent 7px 11px); }
+  .token.hatch-b { background-image: repeating-linear-gradient(45deg, transparent 0 5px, rgba(83,56,98,.22) 5px 7px, transparent 7px 11px); }
+
+  .learning-zone { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(180px, .85fr); gap: .42cqmin; margin: .42cqmin 0; align-items: stretch; }
+  .student-path { display: flex; flex-direction: column; justify-content: center; gap: .3cqmin; padding: .42cqmin; border: 2px solid var(--line); border-radius: .36cqmin; background: rgba(255,255,255,.7); }
+  .teacher-branch { position: relative; display: flex; flex-direction: column; justify-content: center; gap: .25cqmin; padding: .42cqmin; border: 3px dashed #8d78bd; border-radius: .36cqmin; background: var(--purple-bg); text-align: center; color: #423569; font-size: clamp(14pt, .8cqmin, 20pt); }
+  .teacher-branch::before { content: "Training Only"; position: absolute; top: -.45cqmin; right: .38cqmin; padding: .12cqmin .3cqmin; border-radius: 999px; background: var(--purple); color: #fff; font-size: .76em; font-weight: 800; }
+
+  .formula-card { min-height: 6.2cqmin; }
+  .equation { min-height: 2.2cqmin; display: grid; place-items: center; margin: .25cqmin 0; padding: .2cqmin; border-radius: .22cqmin; background: #f1f5f8; color: var(--navy); font-family: Georgia, "Times New Roman", serif; font-size: clamp(15pt, .87cqmin, 22pt); text-align: center; }
+  .formula-card p, .data-card p, .ablation-card p { color: var(--muted); font-size: clamp(15pt, .84cqmin, 21pt); line-height: 1.32; }
+
+  .metric-card { padding: .4cqmin; border-radius: .36cqmin; background: linear-gradient(145deg, #173e65, #2e74ad); color: #fff; text-align: center; }
+  .metric-card strong { display: block; font-size: clamp(24pt, 1.5cqmin, 40pt); line-height: 1; }
+  .metric-card span { display: block; margin-top: .2em; color: #dceef9; font-size: clamp(14pt, .84cqmin, 21pt); line-height: 1.2; }
+
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th, td { padding: .34cqmin .22cqmin; text-align: center; font-size: clamp(15pt, .89cqmin, 22pt); line-height: 1.16; }
+  th { background: var(--navy); color: #fff; }
+  td { border-bottom: 1.5px solid #dbe4eb; color: #334658; }
+  tr:nth-child(even) td { background: #f5f8fa; }
+  .table-note { margin-top: .28cqmin; color: var(--muted); font-size: clamp(14pt, .82cqmin, 20pt); line-height: 1.26; }
+  .table-note span { display: block; }
+
+  .scale-compare, .twostage { display: grid; align-items: center; gap: .34cqmin; }
+  .scale-compare { grid-template-columns: 1fr 1fr; }
+  .twostage { grid-template-columns: minmax(0, 1fr) 2.2cqmin minmax(0, 1fr); }
+  .compare-card, .stage-result { padding: .42cqmin; border: 2px solid var(--line); border-radius: .34cqmin; background: #fff; text-align: center; }
+  .stage-result.win { border-color: #a8d7c4; background: var(--green-bg); }
+  .stage-result strong { display: block; margin: .15em 0; color: var(--navy); font-size: clamp(23pt, 1.32cqmin, 34pt); }
+  .stage-result.win strong { color: var(--green); }
+  .bar-track { height: 1.1cqmin; margin: .18cqmin 0 .35cqmin; overflow: hidden; border-radius: 999px; background: #e1e8ed; }
+  .bar { height: 100%; border-radius: inherit; }
+  .bar.green { background: linear-gradient(90deg, #2f8a69, #54ae8d); }
+  .bar.red { background: linear-gradient(90deg, #c0695f, #df9188); }
+  .scope { border-color: #efd5a9; background: var(--gold-bg); color: #654b25; }
+
+  .footer {
+    position: absolute;
+    inset: auto .99cqmin 0;
+    height: var(--footer-height);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid var(--line);
+    color: #6b7c8e;
+    font-size: clamp(10pt, .55cqmin, 15pt);
+  }
+
+  @page { size: 100cm 75cm; margin: 0; } /* Replace with the requested dimensions. */
+  @media print {
+    html, body { width: var(--poster-width); height: var(--poster-height); background: #fff; }
+    body { display: block; padding: 0; }
+    .poster { box-shadow: none; }
+    * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  }
+</style>
+</head>
+<body>
+<main class="poster layout-standard">
+  <header class="header">
+    <div class="header-main">
+      <div>
+        <h1>[PAPER TITLE]</h1>
+        <div class="subtitle">[One-line scientific promise: what becomes possible and how]</div>
+      </div>
+      <div class="headline-metric">
+        <div class="eyebrow">[Headline result]</div>
+        <strong>[0.00]</strong>
+        <span>[Metric and evaluation context]</span>
+      </div>
+    </div>
+    <div class="header-meta">
+      <div class="header-authors">
+        <div class="authors">[Author One] · [Author Two] · [Author Three]</div>
+        <div class="affiliations">[Institution One] · [Institution Two] · [Contribution notes]</div>
+      </div>
+      <div class="resources">
+        <a href="[REPOSITORY URL]" aria-label="Project repository">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2.02c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.7.08-.7 1.17.08 1.78 1.2 1.78 1.2 1.04 1.78 2.72 1.27 3.38.97.1-.75.4-1.27.74-1.56-2.57-.29-5.27-1.28-5.27-5.68 0-1.26.45-2.28 1.2-3.09-.12-.29-.52-1.47.11-3.05 0 0 .98-.31 3.16 1.18a10.9 10.9 0 0 1 5.76 0c2.18-1.49 3.16-1.18 3.16-1.18.63 1.58.23 2.76.11 3.05.75.81 1.2 1.83 1.2 3.09 0 4.41-2.71 5.38-5.29 5.67.42.36.79 1.06.79 2.14v3.18c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg>
+          [github.com/owner/project]
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <section class="body">
+    <div class="column column-left">
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">📄</span><span>Abstract</span></h2>
+        <div class="panel abstract-panel"><p>[State the problem, why existing systems fail, the proposed representation or method, and the practical retrieval or scientific consequence.]</p></div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🎯</span><span>Motivation: the missing middle</span></h2>
+        <div class="problem-grid">
+          <div class="problem-card bad"><h3>[Prior approach]</h3><ul><li>[Limitation one]</li><li>[Limitation two]</li><li>[Scaling or interpretability cost]</li></ul></div>
+          <div class="problem-card good"><h3>[Desired capability]</h3><ul><li>[Benefit one]</li><li>[Benefit two]</li><li>[Deployment advantage]</li></ul></div>
+        </div>
+        <div class="ideal-strip"><b>Design target:</b><span>[coverage] · [evidence] · [efficient search]</span></div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🏆</span><span>Core contributions</span></h2>
+        <ol class="contrib-list">
+          <li><span class="num">1</span><strong>[Contribution one]</strong>[One concise supporting sentence.]</li>
+          <li><span class="num">2</span><strong>[Contribution two]</strong>[One concise supporting sentence.]</li>
+          <li><span class="num">3</span><strong>[Contribution three]</strong>[One concise supporting sentence.]</li>
+          <li><span class="num">4</span><strong>[Contribution four]</strong>[One concise supporting sentence.]</li>
+        </ol>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🔍</span><span>Inspectable evidence</span></h2>
+        <div class="figure-placeholder">[Replace with a representative qualitative figure]</div>
+        <div class="figure-caption"><b>[Why was this result produced?]</b> [Explain the visible evidence and how a visitor should read it.]</div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🔗</span><span>Workflow</span></h2>
+        <div class="panel workflow">
+          <div class="workflow-step"><b>[Encode]</b>[short detail]</div><div class="arrow">→</div>
+          <div class="workflow-step"><b>[Search]</b>[short detail]</div><div class="arrow">→</div>
+          <div class="workflow-step"><b>[Verify]</b>[short detail]</div>
+        </div>
+      </section>
+    </div>
+
+    <div class="column column-center">
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🧠</span><span>Architecture: inference and training</span></h2>
+        <div class="arch-board">
+          <div class="stage audio">[Query or source input]<span>[modalities and input conditions]</span></div>
+          <div class="connector">[raw or preprocessed signal]</div>
+          <div class="stage codec">[Frozen or learned representation]<span>[parallel streams or feature groups]</span></div>
+          <div class="connector">[factorization or embedding]</div>
+          <div class="streams">
+            <div class="stream-card">[Primary content stream]<div class="token-row"><i class="token"></i><i class="token"></i><i class="token"></i><i class="token"></i><i class="token"></i><i class="token"></i><i class="token"></i><i class="token"></i></div></div>
+            <div class="stream-card">[Residual streams]<div class="token-row"><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i></div><div class="token-row"><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i></div><div class="token-row"><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i><i class="token res"></i></div></div>
+          </div>
+          <div class="connector">[fuse or contextualize]</div>
+          <div class="stage encoder">[Shared encoder]<span>[context-aware hidden states]</span></div>
+          <div class="learning-zone">
+            <div class="student-path">
+              <div class="heads"><div class="head-card">[Head A]</div><div class="head-card">[Head B]</div><div class="head-card">[Head C]</div></div>
+              <div class="token-row"><i class="token active"></i><i class="token off"></i><i class="token off"></i><i class="token active cap"></i><i class="token off"></i><i class="token off"></i><i class="token active logic"></i><i class="token off"></i><span>…</span></div>
+              <p class="small">[Shared vocabulary or output space] · [constraint] · [pruning]</p>
+            </div>
+            <aside class="teacher-branch"><strong>[Textual supervision views]</strong><span>[Frozen teacher or training targets]</span><span>⇠ [alignment losses]</span></aside>
+          </div>
+          <div class="stage output">[Intent-selectable output representation]<span>[human-readable evidence or task output]</span></div>
+          <div class="connector">[similarity or scoring]</div>
+          <div class="stage">[Index, decision, or downstream system]<span>[efficient execution detail]</span></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🔧</span><span>Representation mechanics</span></h2>
+        <div class="formula-grid">
+          <div class="formula-card"><h4>[Mechanic one]</h4><div class="equation">[compact equation]</div><p>[Three to four lines of explanation.]</p></div>
+          <div class="formula-card"><h4>[Mechanic two]</h4><div class="equation">[schedule or transformation]</div><p>[Three to four lines of explanation.]</p></div>
+          <div class="formula-card"><h4>[Index-aware learning]</h4><div class="equation">L = L<sub>a</sub> + L<sub>b</sub> + L<sub>c</sub></div><p>[Explain alignment, robustness, and efficiency penalties.]</p></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🗂️</span><span>Training data &amp; evaluation</span></h2>
+        <div class="panel data-grid">
+          <div class="data-card"><h4>[Data group A]</h4><p>[size and grounding]</p></div>
+          <div class="data-card"><h4>[Data group B]</h4><p>[size and grounding]</p></div>
+          <div class="data-card"><h4>[Data group C]</h4><p>[size and grounding]</p></div>
+          <div class="data-card"><h4>[Evaluation]</h4><p>[in-domain and transfer]</p></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="column column-right">
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">📊</span><span>Headline results</span></h2>
+        <div class="metric-row">
+          <div class="metric-card"><strong>[1.00]</strong><span>[primary quality metric]</span></div>
+          <div class="metric-card"><strong>[7.1%]</strong><span>[efficiency metric]</span></div>
+          <div class="metric-card"><strong>[90%]</strong><span>[candidate reduction]</span></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🔎</span><span>First-stage retrieval</span></h2>
+        <div class="panel">
+          <table>
+            <thead><tr><th>Dataset</th><th>Setting</th><th>Metric A</th><th>Metric B</th><th>Latency</th></tr></thead>
+            <tbody><tr><td>[A]</td><td>In-domain</td><td>[1.000]</td><td>[8.9%]</td><td>[3.1 ms]</td></tr><tr><td>[B]</td><td>In-domain</td><td>[1.000]</td><td>[7.1%]</td><td>[3.4 ms]</td></tr><tr><td>[C]</td><td>Zero-shot</td><td>[0.957]</td><td>[14.0%]</td><td>[2.2 ms]</td></tr><tr><td>[D]</td><td>Zero-shot</td><td>[0.817]</td><td>[17.9%]</td><td>[3.6 ms]</td></tr></tbody>
+          </table>
+          <div class="table-note"><span><b>[Metric A]</b>: [one-line definition].</span><span><b>[Metric B]</b>: [one-line definition].</span><span><b>[Zero-shot]</b>: [one-line definition].</span></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">⚡</span><span>Scale and efficiency</span></h2>
+        <div class="panel scale-compare">
+          <div class="compare-card"><h4>[Index memory]</h4><p class="small">[Proposed]</p><div class="bar-track"><div class="bar green" style="width:8%"></div></div><p class="small">[Dense baseline]</p><div class="bar-track"><div class="bar red" style="width:100%"></div></div></div>
+          <div class="compare-card"><h4>[Query latency]</h4><p class="small">[Proposed]</p><div class="bar-track"><div class="bar green" style="width:20%"></div></div><p class="small">[Baseline]</p><div class="bar-track"><div class="bar red" style="width:100%"></div></div></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🔁</span><span>Two-stage retrieval</span></h2>
+        <div class="panel">
+          <div class="twostage"><div class="stage-result"><span class="small">[Direct baseline]</span><strong>[43.1%]</strong><span class="small">[full reranking]</span></div><div class="arrow">→</div><div class="stage-result win"><span class="small">[Proposed → reranker]</span><strong>[52.1%]</strong><span class="small">[10% reranking]</span></div></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🍀</span><span>Why the components?</span></h2>
+        <div class="ablation-grid"><div class="ablation-card"><h4>[Case A]</h4><p>[Component effect and exact delta.]</p></div><div class="ablation-card"><h4>[Case B]</h4><p>[Component effect and exact delta.]</p></div><div class="ablation-card"><h4>[Case C]</h4><p>[Component effect and exact delta.]</p></div><div class="ablation-card"><h4>[Case D]</h4><p>[Component effect and exact delta.]</p></div></div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title"><span class="section-icon">🚀</span><span>Deployment scope</span></h2>
+        <div class="panel scope"><p class="small">[Explain the intended role, what remains outside scope, and which downstream systems benefit.]</p></div>
+      </section>
+    </div>
+  </section>
+
+  <footer class="footer"><span>[Venue or project footer]</span><span>[Short keywords or funding line]</span></footer>
+</main>
+</body>
+</html>
